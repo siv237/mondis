@@ -1,0 +1,11 @@
+[package]
+name = "mondis-ddc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+mondis-core = { path = "../mondis-core" }
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "time"] }
+regex = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "mondis-x11"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+x11rb = { version = "0.13", features = ["randr"] }
+hex = "0.4"
+mondis_core = { package = "mondis-core", path = "../mondis-core" }

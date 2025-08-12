@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/mondis-core",
+    "crates/mondis-x11",
+    "crates/mondis-ddc",
+    "crates/mondis-panel",
+]
+resolver = "2"
+default-members = [
+    "crates/mondis-core",
+    "crates/mondis-x11",
+    "crates/mondis-ddc",
+]
