@@ -15,3 +15,4 @@ i2cdev = "0.6"
 # Async
 async-channel = "2.0"
 # EDID parsing - manual implementation
+hex = "0.4"
