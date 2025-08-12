@@ -206,6 +206,57 @@ fn read_edid(i2c_bus: u8) -> Result<(String, String, String), String> {
     Ok((manufacturer, model, serial))
 }
 
+fn get_gpu_model_name(vendor_id: &str, device_id: &str) -> Option<String> {
+    // Mapping common GPU device IDs to model names
+    match (vendor_id, device_id) {
+        // NVIDIA RTX 40 series
+        ("0x10de", "0x2684") => Some("RTX 4090".to_string()),
+        ("0x10de", "0x2782") => Some("RTX 4070 Ti".to_string()),
+        ("0x10de", "0x2786") => Some("RTX 4070".to_string()),
+        ("0x10de", "0x2788") => Some("RTX 4060 Ti".to_string()),
+        ("0x10de", "0x28e0") => Some("RTX 4060".to_string()),
+        
+        // NVIDIA RTX 30 series
+        ("0x10de", "0x2204") => Some("RTX 3090".to_string()),
+        ("0x10de", "0x2206") => Some("RTX 3080".to_string()),
+        ("0x10de", "0x2484") => Some("RTX 3070".to_string()),
+        ("0x10de", "0x2504") => Some("RTX 3060".to_string()),
+        ("0x10de", "0x2487") => Some("RTX 3060 Ti".to_string()),
+        
+        // NVIDIA RTX 20 series
+        ("0x10de", "0x1e04") => Some("RTX 2080 Ti".to_string()),
+        ("0x10de", "0x1e07") => Some("RTX 2080".to_string()),
+        ("0x10de", "0x1f02") => Some("RTX 2070".to_string()),
+        ("0x10de", "0x1f06") => Some("RTX 2060".to_string()),
+        
+        // NVIDIA GTX 16 series
+        ("0x10de", "0x2182") => Some("GTX 1660 Ti".to_string()),
+        ("0x10de", "0x21c4") => Some("GTX 1660".to_string()),
+        ("0x10de", "0x1f82") => Some("GTX 1650".to_string()),
+        
+        // AMD RX 7000 series
+        ("0x1002", "0x744c") => Some("RX 7900 XTX".to_string()),
+        ("0x1002", "0x7448") => Some("RX 7900 XT".to_string()),
+        ("0x1002", "0x747e") => Some("RX 7800 XT".to_string()),
+        ("0x1002", "0x7479") => Some("RX 7700 XT".to_string()),
+        
+        // AMD RX 6000 series
+        ("0x1002", "0x73bf") => Some("RX 6900 XT".to_string()),
+        ("0x1002", "0x73df") => Some("RX 6800 XT".to_string()),
+        ("0x1002", "0x73ef") => Some("RX 6800".to_string()),
+        ("0x1002", "0x73ff") => Some("RX 6700 XT".to_string()),
+        ("0x1002", "0x7421") => Some("RX 6600 XT".to_string()),
+        ("0x1002", "0x73e3") => Some("RX 6600".to_string()),
+        
+        // Intel Arc
+        ("0x8086", "0x56a0") => Some("Arc A770".to_string()),
+        ("0x8086", "0x56a1") => Some("Arc A750".to_string()),
+        ("0x8086", "0x56a5") => Some("Arc A380".to_string()),
+        
+        _ => None,
+    }
+}
+
 fn get_gpu_name_from_card(card_num: u8) -> String {
     // Try to get GPU name from sysfs
     let device_path = format!("/sys/class/drm/card{}/device", card_num);
@@ -218,10 +269,23 @@ fn get_gpu_name_from_card(card_num: u8) -> String {
         let vendor_id = vendor.trim();
         let device_id = device.trim();
         
-        // Map common vendor IDs to names
+        // Try to get specific model name
+        if let Some(model) = get_gpu_model_name(vendor_id, device_id) {
+            let vendor_name = match vendor_id {
+                "0x10de" => "NVIDIA",
+                "0x1002" => "AMD",
+                "0x8086" => "Intel",
+                _ => "Unknown",
+            };
+            let result = format!("{} {}", vendor_name, model);
+            println!("GPU info for card{}: {} (vendor: {}, device: {})", card_num, result, vendor_id, device_id);
+            return result;
+        }
+        
+        // Fallback to generic vendor name
         let vendor_name = match vendor_id {
             "0x10de" => "NVIDIA",
-            "0x1002" => "AMD",
+            "0x1002" => "AMD", 
             "0x8086" => "Intel",
             _ => "Unknown GPU",
         };
@@ -248,13 +312,18 @@ fn parse_connector_info(connector: &str) -> (Option<String>, Option<String>, u8)
         let card_num = card_part.replace("card", "").parse::<u8>().unwrap_or(0);
         let card_name = get_gpu_name_from_card(card_num);
         
-        let port_name = match port_type {
-            "HDMI" => format!("HDMI Port {}", port_num),
-            "DP" => format!("DisplayPort {}", port_num),
-            "DVI" => format!("DVI Port {}", port_num),
-            "VGA" => format!("VGA Port {}", port_num),
-            _ => format!("{} Port {}", port_type, port_num),
+        // Convert port identifiers to logical numbering
+        let logical_port_num = match (port_type, port_num) {
+            ("HDMI", "A") => "1",
+            ("HDMI", n) => n,
+            ("DP", "1") => "1", 
+            ("DP", "2") => "2",
+            ("DP", "3") => "3",
+            ("DP", "4") => "4",
+            (_, n) => n,
         };
+        
+        let port_name = format!("Port {}", logical_port_num);
         
         println!("Parsed: card_name={}, port_name={}, card_num={}", card_name, port_name, card_num);
         (Some(card_name), Some(port_name), card_num)
@@ -683,7 +752,24 @@ fn build_ui(app: &Application) {
                                     "нет управления"
                                 };
                                 
-                                let display_text = format!("{}: {} ({})", port_info, monitor_name, control_method);
+                                // Determine port type from connector info
+                                let port_type = if let Some(ref connector) = d.connector {
+                                    if connector.contains("HDMI") {
+                                        "HDMI"
+                                    } else if connector.contains("DP") {
+                                        "DisplayPort"
+                                    } else if connector.contains("DVI") {
+                                        "DVI"
+                                    } else if connector.contains("VGA") {
+                                        "VGA"
+                                    } else {
+                                        "Unknown"
+                                    }
+                                } else {
+                                    "Unknown"
+                                };
+                                
+                                let display_text = format!("{}: {} - {} ({})", port_info, port_type, monitor_name, control_method);
                                 let label = Label::new(Some(&display_text));
                                 label.set_width_chars(40);
                             let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
