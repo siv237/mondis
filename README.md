@@ -43,13 +43,63 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 **Для Debian / Ubuntu:**
 ```bash
 # Основные инструменты для сборки
-sudo apt install build-essential
+sudo apt install -y build-essential pkg-config curl git
 
-# Зависимости для GUI (GTK) и системного трея
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev
+# Зависимости для GUI (GTK4)
+sudo apt install -y libgtk-4-dev
 
-# Зависимости для взаимодействия с мониторами
-sudo apt install libddcutil-dev libxrandr-dev
+# Утилиты для взаимодействия с мониторами
+# Программная яркость опирается на xrandr (нужен бинарник),
+# аппаратная — на доступ к /dev/i2c-*
+sudo apt install -y x11-xserver-utils i2c-tools
+
+# (Опционально) ddcutil как внешняя утилита для диагностики
+sudo apt install -y ddcutil
+```
+
+Примечания по зависимостям:
+- Проект использует GTK4. Пакеты GTK3 (например, libgtk-3-dev) не требуются.
+- Библиотека `libxrandr-dev` не нужна: используется именно утилита `xrandr` (бинарь),
+  а не заголовки XRandR. Убедитесь, что `xrandr` доступен в PATH.
+- Для аппаратного управления по DDC/CI требуется доступ к I2C-устройствам
+  (`/dev/i2c-*`). На Debian/Ubuntu добавьте пользователя в группу `i2c`:
+  ```bash
+  sudo usermod -aG i2c $USER
+  # затем выйдите и зайдите в сессию, либо выполните re-login
+  ```
+  При необходимости можно добавить udev-правило (пример):
+  ```bash
+  echo 'KERNEL=="i2c-[0-9]*", MODE="0660", GROUP="i2c"' | sudo tee /etc/udev/rules.d/60-i2c.rules
+  sudo udevadm control --reload-rules && sudo udevadm trigger
+  ```
+
+**Для Arch Linux / Manjaro:**
+```bash
+sudo pacman -S --needed base-devel pkgconf gtk4 xorg-xrandr i2c-tools git
+```
+
+**Для Fedora:**
+```bash
+sudo dnf install -y @"Development Tools" @"Development Libraries" \
+    gtk4-devel pkgconf-pkg-config xrandr i2c-tools git
+```
+
+**Для CentOS 8/9 Stream (RHEL 8/9):**
+```bash
+# Включить EPEL (для i2c-tools и сопутствующих пакетов)
+sudo dnf install -y epel-release
+
+# Включить дополнительный репозиторий с библиотеками
+# CentOS Stream 8:
+sudo dnf config-manager --set-enabled powertools
+# CentOS Stream 9 / RHEL 9:
+sudo dnf config-manager --set-enabled crb
+
+# Наборы инструментов для сборки
+sudo dnf groupinstall -y "Development Tools" "Development Libraries"
+
+# Зависимости
+sudo dnf install -y gtk4-devel pkgconf-pkg-config xrandr i2c-tools git
 ```
 
 ## Сборка и запуск
@@ -74,6 +124,11 @@ sudo apt install libddcutil-dev libxrandr-dev
 3.  **Запуск приложения:**
 
     Основной исполняемый файл находится в пакете `mondis-panel-direct`.
+    Для отладки:
+    ```bash
+    cargo run -p mondis-panel-direct
+    ```
+    Для релизного запуска:
     ```bash
     cargo run -p mondis-panel-direct --release
     ```
@@ -88,3 +143,10 @@ sudo apt install libddcutil-dev libxrandr-dev
 ## Лицензия
 
 Этот проект распространяется под лицензией [MIT](./LICENSE).
+
+## Примечания по окружению (X11 / Wayland)
+
+- Программная регулировка яркости через `xrandr` работает в X11-сессии.
+- В Wayland-сессиях `xrandr` недоступен; понадобится альтернативная интеграция
+  (например, протоколы порталов/композитора). В текущей версии под Wayland
+  доступны только аппаратные методы через DDC/CI (если есть доступ к I2C).
