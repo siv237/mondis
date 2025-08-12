@@ -32,6 +32,7 @@ struct DisplayInfo {
     manufacturer: Option<String>,
     model: Option<String>,
     serial: Option<String>,
+    connector: Option<String>,
     supports_ddc: bool,
 }
 
@@ -121,7 +122,7 @@ fn parse_edid_model(edid_data: &[u8]) -> String {
     "Monitor".to_string()
 }
 
-fn get_all_edids_from_sysfs() -> Vec<(String, String, String)> {
+fn get_all_edids_from_sysfs() -> Vec<(String, String, String, String)> {
     let mut edids = Vec::new();
     let drm_path = "/sys/class/drm";
     
@@ -142,7 +143,7 @@ fn get_all_edids_from_sysfs() -> Vec<(String, String, String)> {
                                 (edid_data[15] as u32)
                             );
                             println!("Found EDID in {}: {} {}", name, manufacturer, model);
-                            edids.push((manufacturer, model, serial));
+                            edids.push((manufacturer, model, serial, name.to_string()));
                         }
                     }
                 }
@@ -232,15 +233,15 @@ fn detect_i2c_displays() -> Result<Vec<DisplayInfo>, String> {
             let supports_ddc = ddc_get_brightness(bus).is_ok();
             
             // Assign EDID info based on known mapping
-            let (manufacturer, model, serial) = if let Some(&edid_idx) = bus_edid_map.get(&bus) {
+            let (manufacturer, model, serial, connector) = if let Some(&edid_idx) = bus_edid_map.get(&bus) {
                 if edid_idx < all_edids.len() {
                     let edid = &all_edids[edid_idx];
-                    (Some(edid.0.clone()), Some(edid.1.clone()), Some(edid.2.clone()))
+                    (Some(edid.0.clone()), Some(edid.1.clone()), Some(edid.2.clone()), Some(edid.3.clone()))
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
             
             let name = match (&manufacturer, &model) {
@@ -258,10 +259,13 @@ fn detect_i2c_displays() -> Result<Vec<DisplayInfo>, String> {
                         "MSI" => "MSI",
                         _ => mfg,
                     };
+                    let connector_info = connector.as_ref()
+                        .map(|c| format!(" • {}", c))
+                        .unwrap_or_default();
                     if supports_ddc {
-                        format!("{} {} (I2C bus {})", expanded_mfg, mdl, bus)
+                        format!("{} {}{}", expanded_mfg, mdl, connector_info)
                     } else {
-                        format!("{} {} (I2C bus {}) - не поддерживает DDC", expanded_mfg, mdl, bus)
+                        format!("{} {}{} - не поддерживает DDC", expanded_mfg, mdl, connector_info)
                     }
                 }
                 _ => {
@@ -281,6 +285,7 @@ fn detect_i2c_displays() -> Result<Vec<DisplayInfo>, String> {
                     manufacturer,
                     model,
                     serial,
+                    connector,
                     supports_ddc,
                 });
             }
