@@ -1,9 +1,11 @@
 use anyhow::Result;
 use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, Scale, Separator, Button};
+use gtk::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, Scale, Separator, Button, HeaderBar, CssProvider, Image};
+use gtk::gdk::Display as GdkDisplay;
 use tracing_subscriber::EnvFilter;
 use glib::clone;
 use std::rc::Rc;
+use std::cell::Cell;
 use std::thread;
 
 use std::time::Duration;
@@ -11,6 +13,42 @@ use std::process::Command;
 use i2cdev::linux::LinuxI2CDevice;
 use i2cdev::core::I2CDevice;
 
+fn setup_styles() {
+    // Современные стили: карточки, отступы, скругления
+    let css = r#"
+    .root { background-color: @theme_bg_color; }
+    .card { 
+        padding: 12px; 
+        border-radius: 10px; 
+        border: 1px solid alpha(@theme_fg_color, 0.08);
+        background-color: alpha(@theme_base_color, 0.6);
+    }
+    .section-title { font-weight: 700; opacity: 0.9; }
+    .gpu-title { font-weight: 700; margin-top: 8px; }
+    .row { spacing: 12px; }
+    .info-box { spacing: 8px; }
+    .badge { 
+        padding: 2px 8px; 
+        border-radius: 999px; 
+        font-size: 11px; 
+        color: rgba(0,0,0,0.85);
+        background-color: rgba(0,0,0,0.06);
+        margin-left: 6px;
+    }
+    .badge-ddc { background-color: rgba(46,160,67,0.18); }
+    .badge-xrandr { background-color: rgba(56,139,253,0.16); }
+    .badge-none { background-color: rgba(0,0,0,0.08); }
+    .port { opacity: 0.8; }
+    .type { opacity: 0.8; }
+    .monitor { font-weight: 600; }
+    "#;
+
+    let provider = CssProvider::new();
+    provider.load_from_data(css);
+    if let Some(display) = GdkDisplay::default() {
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+}
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
@@ -734,29 +772,70 @@ fn group_displays_by_card(displays: Vec<DisplayInfo>) -> Vec<VideoCard> {
 fn build_ui(app: &Application) {
     let win = ApplicationWindow::builder()
         .application(app)
-        .title("Mondis: Прямое I2C управление (v0.1)")
-        .default_width(640)
-        .default_height(360)
+        .title("Mondis Panel")
         .build();
+    // Пусть окно подстраивается под естественный размер контента
+    win.set_resizable(true);
+
+    // По умолчанию светлая тема
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(false);
+    }
+
+    setup_styles();
 
     let vbox = GtkBox::new(Orientation::Vertical, 8);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
+    vbox.add_css_class("root");
 
-    let header = GtkBox::new(Orientation::Horizontal, 8);
-    let title = Label::new(Some("Прямое I2C управление мониторами"));
+    // Современный заголовок окна
+    let headerbar = HeaderBar::new();
+    let title_lbl = Label::new(Some("Mondis"));
+    title_lbl.add_css_class("section-title");
+    headerbar.set_title_widget(Some(&title_lbl));
     let refresh_btn = Button::with_label("Обновить");
-    header.append(&title);
-    header.append(&refresh_btn);
-    vbox.append(&header);
-    vbox.append(&Separator::new(Orientation::Horizontal));
+    refresh_btn.add_css_class("suggested-action");
+
+    // Кнопка переключения темы (день/ночь)
+    let theme_toggle = Button::new();
+    theme_toggle.set_tooltip_text(Some("Светлая/тёмная тема"));
+    let is_dark = Cell::new(false); // состояние темы
+    let icon_sun = Image::from_icon_name("weather-clear-symbolic");
+    theme_toggle.set_child(Some(&icon_sun));
+
+    // Захватываем ссылку на Settings для переключения темы
+    if let Some(settings) = gtk::Settings::default() {
+        let settings_clone = settings.clone();
+        let is_dark_cell = is_dark; // перемещаем в замыкание
+        theme_toggle.connect_clicked(move |btn| {
+            let new_val = !is_dark_cell.get();
+            is_dark_cell.set(new_val);
+            settings_clone.set_gtk_application_prefer_dark_theme(new_val);
+            // Меняем иконку
+            let new_icon = if new_val {
+                Image::from_icon_name("weather-clear-night-symbolic")
+            } else {
+                Image::from_icon_name("weather-clear-symbolic")
+            };
+            btn.set_child(Some(&new_icon));
+        });
+    }
+
+    headerbar.pack_end(&refresh_btn);
+    headerbar.pack_end(&theme_toggle);
+    win.set_titlebar(Some(&headerbar));
 
     let list_box = GtkBox::new(Orientation::Vertical, 12);
+    list_box.set_hexpand(true);
     vbox.append(&list_box);
 
     let list_box_for_populate = list_box.clone();
+    // Используем слабую ссылку на окно и ссылку на корневой контейнер для измерения
+    let win_weak_for_measure = win.downgrade();
+    let content_for_measure = vbox.clone();
     let populate: Rc<dyn Fn()> = Rc::new(move || {
         // Clear list
         while let Some(child) = list_box_for_populate.first_child() {
@@ -775,6 +854,9 @@ fn build_ui(app: &Application) {
         });
         
         let list_box_target = list_box_for_populate.clone();
+        // Клонируем ссылки для измерения, чтобы не тащить исходные и избежать move-проблем
+        let win_weak_for_measure_outer = win_weak_for_measure.clone();
+        let content_for_measure_outer = content_for_measure.clone();
         glib::spawn_future_local(async move {
             if let Ok(msg) = rx.recv().await {
                 match msg {
@@ -788,8 +870,13 @@ fn build_ui(app: &Application) {
                             
                             // Add displays for this card
                             for (display_index, d) in card.displays.into_iter().enumerate() {
-                                let row = GtkBox::new(Orientation::Horizontal, 12);
-                                row.set_margin_start(20); // Indent under card header
+                                // Grid-ряд для ровных колонок: Порт | Тип | Название | Иконка | Бейдж | Слайдер | Значение
+                                let grid = gtk::Grid::new();
+                                grid.set_margin_start(20);
+                                grid.set_column_spacing(12);
+                                grid.set_row_spacing(6);
+                                grid.add_css_class("row");
+                                grid.set_hexpand(true);
                                 
                                 // Create port and monitor info
                                 let default_port = "Unknown Port".to_string();
@@ -814,12 +901,32 @@ fn build_ui(app: &Application) {
                                     _ => "Unknown Monitor".to_string(),
                                 };
                                 
-                                let control_method = if d.supports_ddc {
-                                    "аппаратно"
-                                } else if d.xrandr_output.is_some() {
-                                    "программно"
+                                let (control_method, badge_class, tooltip) = if d.supports_ddc {
+                                    (
+                                        "аппаратно",
+                                        "badge-ddc",
+                                        format!(
+                                            "Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}{}",
+                                            d.i2c_bus,
+                                            d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
+                                        ),
+                                    )
+                                } else if let Some(ref out) = d.xrandr_output {
+                                    (
+                                        "программно",
+                                        "badge-xrandr",
+                                        format!(
+                                            "Управление: программно (xrandr)\nВывод: {}{}",
+                                            out,
+                                            d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
+                                        ),
+                                    )
                                 } else {
-                                    "нет управления"
+                                    (
+                                        "нет управления",
+                                        "badge-none",
+                                        d.connector.as_ref().map(|c| format!("Коннектор: {}", c)).unwrap_or_else(|| "Нет доступного метода".to_string())
+                                    )
                                 };
                                 
                                 // Determine port type from connector info
@@ -839,13 +946,46 @@ fn build_ui(app: &Application) {
                                     "Unknown"
                                 };
                                 
-                                let display_text = format!("{}: {} - {} ({})", port_info, port_type, monitor_name, control_method);
-                                let label = Label::new(Some(&display_text));
-                                label.set_width_chars(40);
-                            let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-                            scale.set_hexpand(true);
-                            scale.set_draw_value(true);
-                            scale.set_value_pos(gtk::PositionType::Right);
+                                // Колонки: порт, тип, название, иконка, бейдж
+                                let port_lbl = Label::new(Some(port_info));
+                                port_lbl.add_css_class("port");
+                                port_lbl.set_xalign(0.0);
+                                port_lbl.set_width_chars(14);
+                                let type_lbl = Label::new(Some(port_type));
+                                type_lbl.add_css_class("type");
+                                type_lbl.set_xalign(0.0);
+                                type_lbl.set_width_chars(12);
+                                let monitor_lbl = Label::new(Some(&monitor_name));
+                                monitor_lbl.add_css_class("monitor");
+                                monitor_lbl.set_xalign(0.0);
+                                monitor_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                                monitor_lbl.set_hexpand(true);
+                                let badge_icon = match badge_class {
+                                    "badge-none" => Image::from_icon_name("dialog-warning-symbolic"),
+                                    _ => Image::from_icon_name("video-display-symbolic"),
+                                };
+                                let badge = Label::new(Some(control_method));
+                                badge.add_css_class("badge");
+                                badge.add_css_class(badge_class);
+                                badge.set_tooltip_text(Some(&tooltip));
+
+                                grid.attach(&port_lbl, 0, 0, 1, 1);
+                                grid.attach(&type_lbl, 1, 0, 1, 1);
+                                grid.attach(&monitor_lbl, 2, 0, 1, 1);
+                                grid.attach(&badge_icon, 3, 0, 1, 1);
+                                grid.attach(&badge, 4, 0, 1, 1);
+
+                                // Правый слайдер и метка значения
+                                let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+                                scale.set_hexpand(false);
+                                scale.set_width_request(320);
+                                scale.set_halign(gtk::Align::End);
+                                scale.set_draw_value(false);
+                                let value_lbl = Label::new(Some("0%"));
+                                value_lbl.set_width_chars(4); // фиксированная ширина 
+                                value_lbl.set_xalign(1.0);
+                                grid.attach(&scale, 5, 0, 1, 1);
+                                grid.attach(&value_lbl, 6, 0, 1, 1);
                             
                             // Try to get brightness using any available method
                             if !d.supports_ddc && d.xrandr_output.is_none() {
@@ -862,16 +1002,19 @@ fn build_ui(app: &Application) {
                                     let _ = s_tx.send_blocking(res);
                                 });
                                 
-                                glib::spawn_future_local(clone!(@strong scale, @strong label => async move {
+                                let grid_for_tooltip = grid.clone();
+                                glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl => async move {
                                     if let Ok(res) = s_rx.recv().await {
                                         match res {
                                             Ok(v) => {
                                                 scale.set_value(v as f64);
                                                 scale.set_sensitive(true);
+                                                value_lbl.set_text(&format!("{}%", v));
                                             }
                                             Err(e) => {
                                                 scale.set_sensitive(false);
-                                                label.set_text(&format!("{} (ошибка: {})", label.text(), e));
+                                                // Показываем ошибку в подсказке ряда
+                                                grid_for_tooltip.set_tooltip_text(Some(&format!("Ошибка чтения яркости: {}", e)));
                                             }
                                         }
                                     }
@@ -884,8 +1027,10 @@ fn build_ui(app: &Application) {
                                 
                                 println!("Creating callback for: {} (bus {}) [index: {}]", d.name, d.i2c_bus, display_index);
                                 
+                                let value_lbl_for_change = value_lbl.clone();
                                 scale.connect_value_changed(move |s| {
                                     let val = s.value() as u8;
+                                    value_lbl_for_change.set_text(&format!("{}%", val));
                                     let display_clone = display_info_for_callback.clone();
                                     let callback_id = format!("{}_{}_bus{}", display_clone.name, display_index, display_clone.i2c_bus);
                                     
@@ -903,9 +1048,12 @@ fn build_ui(app: &Application) {
                                 });
                             }
                             
-                                row.append(&label);
-                                row.append(&scale);
-                                list_box_target.append(&row);
+                                // Оборачиваем в "карточку"
+                                let frame = gtk::Frame::new(None);
+                                frame.add_css_class("card");
+                                frame.set_hexpand(true);
+                                frame.set_child(Some(&grid));
+                                list_box_target.append(&frame);
                             }
                             
                             // Add separator after each card
@@ -914,6 +1062,18 @@ fn build_ui(app: &Application) {
                             separator.set_margin_bottom(8);
                             list_box_target.append(&separator);
                         }
+
+                        // После полного наполнения списка — один раз подстроим окно под контент
+                        let win_weak_local = win_weak_for_measure_outer.clone();
+                        let content_for_measure_local = content_for_measure_outer.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(win) = win_weak_local.upgrade() {
+                                let (_, nat_w, _, _) = content_for_measure_local.measure(Orientation::Horizontal, -1);
+                                let (_, nat_h, _, _) = content_for_measure_local.measure(Orientation::Vertical, -1);
+                                // небольшой запас под заголовок/паддинги
+                                win.set_size_request(nat_w + 48, nat_h + 64);
+                            }
+                        });
                     }
                     Ok(_) => {
                         let lbl = Label::new(Some("(Видеокарт с мониторами не найдено)"));
