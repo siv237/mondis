@@ -5,3 +5,6 @@ Cargo.lock
 *.swo
 *~
 .kiro
+/.codeium/
+/.codeium/windsurf/
+/.windsurf/
