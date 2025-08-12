@@ -257,8 +257,74 @@ fn get_gpu_model_name(vendor_id: &str, device_id: &str) -> Option<String> {
     }
 }
 
+fn get_gpu_name_from_lspci() -> Option<String> {
+    // Try to get GPU name from lspci command
+    let output = Command::new("lspci")
+        .arg("-nn")
+        .output()
+        .ok()?;
+    
+    if !output.status.success() {
+        return None;
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse lspci output to find VGA/Display controller
+    for line in stdout.lines() {
+        if line.contains("VGA compatible controller") || line.contains("Display controller") {
+            // Extract GPU name from line like:
+            // "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GA106 [GeForce RTX 3060 Lite Hash Rate] [10de:2504] (rev a1)"
+            if let Some(colon_pos) = line.find(": ") {
+                let gpu_part = &line[colon_pos + 2..];
+                // Remove the final PCI ID part [10de:2504] and revision
+                let gpu_name = gpu_part
+                    .split(" [")
+                    .last()
+                    .unwrap_or(gpu_part)
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                
+                if !gpu_name.is_empty() {
+                    // Extract just the model name from full string
+                    // "NVIDIA Corporation GA106 [GeForce RTX 3060 Lite Hash Rate]" -> "GeForce RTX 3060 Lite Hash Rate"
+                    if let Some(bracket_start) = gpu_part.find('[') {
+                        if let Some(bracket_end) = gpu_part.find(']') {
+                            let model_name = &gpu_part[bracket_start + 1..bracket_end];
+                            if !model_name.is_empty() {
+                                // Get vendor from the beginning
+                                let vendor_part = &gpu_part[..bracket_start].trim();
+                                let vendor = if vendor_part.contains("NVIDIA") {
+                                    "NVIDIA"
+                                } else if vendor_part.contains("AMD") || vendor_part.contains("ATI") {
+                                    "AMD"
+                                } else if vendor_part.contains("Intel") {
+                                    "Intel"
+                                } else {
+                                    "Unknown"
+                                };
+                                return Some(format!("{} {}", vendor, model_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 fn get_gpu_name_from_card(card_num: u8) -> String {
-    // Try to get GPU name from sysfs
+    // First try to get name from lspci (most accurate)
+    if let Some(lspci_name) = get_gpu_name_from_lspci() {
+        println!("GPU info for card{}: {} (from lspci)", card_num, lspci_name);
+        return lspci_name;
+    }
+    
+    // Fallback to sysfs PCI ID lookup
     let device_path = format!("/sys/class/drm/card{}/device", card_num);
     
     // Try to read vendor and device IDs
@@ -269,7 +335,7 @@ fn get_gpu_name_from_card(card_num: u8) -> String {
         let vendor_id = vendor.trim();
         let device_id = device.trim();
         
-        // Try to get specific model name
+        // Try to get specific model name from our table
         if let Some(model) = get_gpu_model_name(vendor_id, device_id) {
             let vendor_name = match vendor_id {
                 "0x10de" => "NVIDIA",
@@ -278,7 +344,7 @@ fn get_gpu_name_from_card(card_num: u8) -> String {
                 _ => "Unknown",
             };
             let result = format!("{} {}", vendor_name, model);
-            println!("GPU info for card{}: {} (vendor: {}, device: {})", card_num, result, vendor_id, device_id);
+            println!("GPU info for card{}: {} (from PCI ID table)", card_num, result);
             return result;
         }
         
@@ -291,7 +357,7 @@ fn get_gpu_name_from_card(card_num: u8) -> String {
         };
         
         let result = format!("{} Card {}", vendor_name, card_num);
-        println!("GPU info for card{}: {} (vendor: {}, device: {})", card_num, result, vendor_id, device_id);
+        println!("GPU info for card{}: {} (generic fallback)", card_num, result);
         result
     } else {
         let result = format!("Card {}", card_num);
@@ -312,18 +378,22 @@ fn parse_connector_info(connector: &str) -> (Option<String>, Option<String>, u8)
         let card_num = card_part.replace("card", "").parse::<u8>().unwrap_or(0);
         let card_name = get_gpu_name_from_card(card_num);
         
-        // Convert port identifiers to logical numbering
-        let logical_port_num = match (port_type, port_num) {
-            ("HDMI", "A") => "1",
-            ("HDMI", n) => n,
-            ("DP", "1") => "1", 
-            ("DP", "2") => "2",
-            ("DP", "3") => "3",
-            ("DP", "4") => "4",
-            (_, n) => n,
+        // Use full descriptive port names instead of simplified numbering
+        let port_name = match port_type {
+            "HDMI" => {
+                if port_num == "A" {
+                    format!("HDMI Port A")
+                } else {
+                    format!("HDMI Port {}", port_num)
+                }
+            },
+            "DP" => format!("DisplayPort {}", port_num),
+            "DVI" => format!("DVI Port {}", port_num),
+            "VGA" => format!("VGA Port {}", port_num),
+            "eDP" => format!("eDP Port {}", port_num),
+            "LVDS" => format!("LVDS Port {}", port_num),
+            _ => format!("{} Port {}", port_type, port_num),
         };
-        
-        let port_name = format!("Port {}", logical_port_num);
         
         println!("Parsed: card_name={}, port_name={}, card_num={}", card_name, port_name, card_num);
         (Some(card_name), Some(port_name), card_num)
