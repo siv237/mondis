@@ -1,0 +1,17 @@
+[package]
+name = "mondis-panel-direct"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# GTK
+gtk = { package = "gtk4", version = "0.7", features = ["v4_10"] }
+glib = "0.18"
+# I2C direct access
+i2cdev = "0.6"
+# Async
+async-channel = "2.0"
+# EDID parsing - manual implementation

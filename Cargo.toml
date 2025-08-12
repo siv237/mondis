@@ -4,6 +4,7 @@ members = [
     "crates/mondis-x11",
     "crates/mondis-ddc",
     "crates/mondis-panel",
+    "crates/mondis-panel-direct",
 ]
 resolver = "2"
 default-members = [
