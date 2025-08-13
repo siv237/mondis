@@ -16,3 +16,5 @@ i2cdev = "0.6"
 async-channel = "2.0"
 # EDID parsing - manual implementation
 hex = "0.4"
+# XML and file operations
+serde = { version = "1.0", features = ["derive"] }

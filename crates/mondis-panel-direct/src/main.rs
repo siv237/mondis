@@ -5,13 +5,16 @@ use gtk::gdk::Display as GdkDisplay;
 use tracing_subscriber::EnvFilter;
 use glib::clone;
 use std::rc::Rc;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::thread;
+use std::collections::HashMap;
 
 use std::time::Duration;
 use std::process::Command;
 use i2cdev::linux::LinuxI2CDevice;
 use i2cdev::core::I2CDevice;
+use std::fs;
+use std::path::PathBuf;
 
 fn setup_styles() {
     // Современные стили: карточки, отступы, скругления
@@ -41,6 +44,81 @@ fn setup_styles() {
     .port { opacity: 0.8; }
     .type { opacity: 0.8; }
     .monitor { font-weight: 600; }
+    .confirm-bar { 
+        padding: 12px; 
+        border-radius: 8px; 
+        background: alpha(@warning_color, 0.1);
+        border: 1px solid alpha(@warning_color, 0.3);
+        margin-bottom: 12px;
+    }
+    .confirm-button { 
+        background: @success_color; 
+        color: white; 
+        border-radius: 6px; 
+        padding: 8px 16px;
+        font-weight: 600;
+        border: none;
+    }
+    .cancel-button { 
+        background: @error_color; 
+        color: white; 
+        border-radius: 6px; 
+        padding: 8px 16px;
+        font-weight: 600;
+        margin-left: 8px;
+        border: none;
+    }
+    .timer-label { 
+        font-weight: 700; 
+        color: @warning_color;
+        margin-right: 12px;
+        font-size: 14px;
+    }
+    
+    /* Адаптивные цвета для светлой темы */
+    @define-color warning_color_light #047857; /* темно-зеленый для светлой темы */
+    @define-color success_color_light #059669;
+    @define-color error_color_light #dc2626;
+    
+    /* Адаптивные цвета для темной темы */
+    @define-color warning_color_dark #34d399; /* светло-зеленый для темной темы */
+    @define-color success_color_dark #10b981;
+    @define-color error_color_dark #ef4444;
+    
+    /* Автоматический выбор цветов в зависимости от темы */
+    .timer-label {
+        color: mix(@warning_color_light, @warning_color_dark, 0.5);
+    }
+    
+    /* Для светлой темы */
+    window:not(.dark) .timer-label {
+        color: @warning_color_light;
+    }
+    window:not(.dark) .confirm-button {
+        background: @success_color_light;
+    }
+    window:not(.dark) .cancel-button {
+        background: @error_color_light;
+    }
+    window:not(.dark) .confirm-bar {
+        background: alpha(@warning_color_light, 0.1);
+        border-color: alpha(@warning_color_light, 0.3);
+    }
+    
+    /* Для темной темы */
+    window.dark .timer-label {
+        color: @warning_color_dark;
+    }
+    window.dark .confirm-button {
+        background: @success_color_dark;
+    }
+    window.dark .cancel-button {
+        background: @error_color_dark;
+    }
+    window.dark .confirm-bar {
+        background: alpha(@warning_color_dark, 0.1);
+        border-color: alpha(@warning_color_dark, 0.3);
+    }
     "#;
 
     let provider = CssProvider::new();
@@ -84,10 +162,201 @@ struct VideoCard {
     displays: Vec<DisplayInfo>,
 }
 
+#[derive(Clone, Debug)]
+struct BrightnessState {
+    original_values: HashMap<u8, u8>, // i2c_bus -> brightness value
+    current_values: HashMap<u8, u8>,
+    has_changes: bool,
+    timer_active: bool,
+}
+
+// Структура для хранения ссылок на UI элементы
+struct SliderRefs {
+    sliders: HashMap<u8, (Scale, Label)>, // i2c_bus -> (slider, value_label)
+    programmatic_update: HashMap<u8, bool>, // флаг программного обновления
+}
+
+impl BrightnessState {
+    fn new() -> Self {
+        Self {
+            original_values: HashMap::new(),
+            current_values: HashMap::new(),
+            has_changes: false,
+            timer_active: false,
+        }
+    }
+    
+    fn save_original(&mut self, bus: u8, value: u8) {
+        if !self.original_values.contains_key(&bus) {
+            self.original_values.insert(bus, value);
+        }
+        self.current_values.insert(bus, value);
+    }
+    
+    fn update_current(&mut self, bus: u8, value: u8) {
+        self.current_values.insert(bus, value);
+        if let Some(&original) = self.original_values.get(&bus) {
+            self.has_changes = original != value || self.has_changes_for_other_buses(bus);
+        }
+    }
+    
+    fn has_changes_for_other_buses(&self, exclude_bus: u8) -> bool {
+        for (&bus, &current) in &self.current_values {
+            if bus != exclude_bus {
+                if let Some(&original) = self.original_values.get(&bus) {
+                    if original != current {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    fn reset_to_original(&mut self) {
+        self.current_values = self.original_values.clone();
+        self.has_changes = false;
+        self.timer_active = false;
+    }
+    
+    fn confirm_changes(&mut self) {
+        self.original_values = self.current_values.clone();
+        self.has_changes = false;
+        self.timer_active = false;
+    }
+}
+
+impl SliderRefs {
+    fn new() -> Self {
+        Self {
+            sliders: HashMap::new(),
+            programmatic_update: HashMap::new(),
+        }
+    }
+    
+    fn add_slider(&mut self, bus: u8, slider: Scale, label: Label) {
+        self.sliders.insert(bus, (slider, label));
+        self.programmatic_update.insert(bus, false);
+    }
+    
+    fn update_slider_value(&mut self, bus: u8, value: u8) {
+        if let Some((slider, label)) = self.sliders.get(&bus) {
+            // Устанавливаем флаг программного обновления
+            self.programmatic_update.insert(bus, true);
+            slider.set_value(value as f64);
+            label.set_text(&format!("{}%", value));
+        }
+    }
+    
+    fn restore_all_sliders(&mut self, original_values: &HashMap<u8, u8>) {
+        for (&bus, &value) in original_values {
+            self.update_slider_value(bus, value);
+        }
+    }
+    
+    fn is_programmatic_update(&mut self, bus: u8) -> bool {
+        if let Some(&is_programmatic) = self.programmatic_update.get(&bus) {
+            if is_programmatic {
+                self.programmatic_update.insert(bus, false); // Сбрасываем флаг
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // DDC/CI constants
 const DDC_ADDR: u16 = 0x37;
 const EDID_ADDR: u16 = 0x50;
 const VCP_BRIGHTNESS: u8 = 0x10;
+
+fn get_profile_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
+    let config_dir = PathBuf::from(home).join(".config").join("mondis");
+    
+    // Создаем директорию если не существует
+    if let Err(e) = fs::create_dir_all(&config_dir) {
+        return Err(format!("Failed to create config directory: {}", e));
+    }
+    
+    Ok(config_dir.join("brightness_profile.xml"))
+}
+
+fn save_brightness_profile(brightness_values: &HashMap<u8, u8>, displays: &[DisplayInfo]) -> Result<(), String> {
+    let profile_path = get_profile_path()?;
+    
+    let mut xml_content = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mondis_profile>\n");
+    xml_content.push_str("  <brightness_settings>\n");
+    
+    for (&bus, &brightness) in brightness_values {
+        // Найдем информацию о дисплее для этого bus
+        if let Some(display) = displays.iter().find(|d| d.i2c_bus == bus) {
+            xml_content.push_str(&format!(
+                "    <display bus=\"{}\" brightness=\"{}\" name=\"{}\" />\n",
+                bus, brightness, 
+                display.name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            ));
+        } else {
+            xml_content.push_str(&format!(
+                "    <display bus=\"{}\" brightness=\"{}\" name=\"Unknown\" />\n",
+                bus, brightness
+            ));
+        }
+    }
+    
+    xml_content.push_str("  </brightness_settings>\n");
+    xml_content.push_str(&format!("  <timestamp>{}</timestamp>\n", 
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    ));
+    xml_content.push_str("</mondis_profile>\n");
+    
+    fs::write(&profile_path, xml_content)
+        .map_err(|e| format!("Failed to write profile to {:?}: {}", profile_path, e))?;
+    
+    println!("Brightness profile saved to: {:?}", profile_path);
+    Ok(())
+}
+
+fn load_brightness_profile() -> Result<HashMap<u8, u8>, String> {
+    let profile_path = get_profile_path()?;
+    
+    if !profile_path.exists() {
+        return Ok(HashMap::new()); // Пустой профиль если файл не существует
+    }
+    
+    let content = fs::read_to_string(&profile_path)
+        .map_err(|e| format!("Failed to read profile: {}", e))?;
+    
+    let mut brightness_values = HashMap::new();
+    
+    // Простой парсинг XML (можно заменить на полноценный XML парсер)
+    for line in content.lines() {
+        if line.trim().starts_with("<display") {
+            if let (Some(bus_start), Some(brightness_start)) = (
+                line.find("bus=\"").map(|i| i + 5),
+                line.find("brightness=\"").map(|i| i + 12)
+            ) {
+                if let (Some(bus_end), Some(brightness_end)) = (
+                    line[bus_start..].find('"').map(|i| i + bus_start),
+                    line[brightness_start..].find('"').map(|i| i + brightness_start)
+                ) {
+                    if let (Ok(bus), Ok(brightness)) = (
+                        line[bus_start..bus_end].parse::<u8>(),
+                        line[brightness_start..brightness_end].parse::<u8>()
+                    ) {
+                        brightness_values.insert(bus, brightness);
+                    }
+                }
+            }
+        }
+    }
+    
+    println!("Loaded brightness profile: {:?}", brightness_values);
+    Ok(brightness_values)
+}
 
 fn ddc_get_brightness(i2c_bus: u8) -> Result<u8, String> {
     let device_path = format!("/dev/i2c-{}", i2c_bus);
@@ -777,9 +1046,27 @@ fn build_ui(app: &Application) {
     // Пусть окно подстраивается под естественный размер контента
     win.set_resizable(true);
 
-    // По умолчанию светлая тема
+    // Определяем текущую тему и добавляем соответствующий CSS класс
     if let Some(settings) = gtk::Settings::default() {
-        settings.set_gtk_application_prefer_dark_theme(false);
+        let is_dark_theme = settings.is_gtk_application_prefer_dark_theme();
+        if is_dark_theme {
+            win.add_css_class("dark");
+        } else {
+            win.add_css_class("light");
+        }
+        
+        // Отслеживаем изменения темы
+        let win_for_theme = win.clone();
+        settings.connect_gtk_application_prefer_dark_theme_notify(move |settings| {
+            let is_dark = settings.is_gtk_application_prefer_dark_theme();
+            if is_dark {
+                win_for_theme.remove_css_class("light");
+                win_for_theme.add_css_class("dark");
+            } else {
+                win_for_theme.remove_css_class("dark");
+                win_for_theme.add_css_class("light");
+            }
+        });
     }
 
     setup_styles();
@@ -828,19 +1115,241 @@ fn build_ui(app: &Application) {
     headerbar.pack_end(&theme_toggle);
     win.set_titlebar(Some(&headerbar));
 
+    // Панель подтверждения изменений (скрыта по умолчанию)
+    let confirm_bar = GtkBox::new(Orientation::Horizontal, 12);
+    confirm_bar.add_css_class("confirm-bar");
+    confirm_bar.set_visible(false);
+    
+    let timer_label = Label::new(Some("Изменения будут отменены через 20 сек"));
+    timer_label.add_css_class("timer-label");
+    
+    let confirm_button = Button::with_label("Подтвердить изменения");
+    confirm_button.add_css_class("confirm-button");
+    
+    let cancel_button = Button::with_label("Отменить");
+    cancel_button.add_css_class("cancel-button");
+    
+    confirm_bar.append(&timer_label);
+    confirm_bar.append(&confirm_button);
+    confirm_bar.append(&cancel_button);
+    vbox.append(&confirm_bar);
+
     let list_box = GtkBox::new(Orientation::Vertical, 12);
     list_box.set_hexpand(true);
     vbox.append(&list_box);
+    
+    // Состояние яркости для отслеживания изменений
+    let brightness_state = Rc::new(RefCell::new(BrightnessState::new()));
+    let slider_refs = Rc::new(RefCell::new(SliderRefs::new()));
+    let timer_source_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    
+    // Функция для запуска таймера обратного отсчета
+    let start_confirmation_timer = {
+        let brightness_state = brightness_state.clone();
+        let slider_refs = slider_refs.clone();
+        let timer_source_id = timer_source_id.clone();
+        let confirm_bar = confirm_bar.clone();
+        let timer_label = timer_label.clone();
+        
+        move |displays: Vec<DisplayInfo>| {
+            // Отменяем предыдущий таймер если есть
+            if let Some(source_id) = timer_source_id.borrow_mut().take() {
+                source_id.remove();
+            }
+            
+            brightness_state.borrow_mut().timer_active = true;
+            confirm_bar.set_visible(true);
+            
+            let countdown = Rc::new(Cell::new(20));
+            let brightness_state_timer = brightness_state.clone();
+            let slider_refs_timer = slider_refs.clone();
+            let timer_source_id_timer = timer_source_id.clone();
+            let confirm_bar_timer = confirm_bar.clone();
+            let timer_label_timer = timer_label.clone();
+            let displays_for_timer = displays.clone();
+            
+            let source_id = glib::timeout_add_seconds_local(1, move || {
+                let remaining = countdown.get();
+                if remaining > 0 {
+                    timer_label_timer.set_text(&format!("Изменения будут отменены через {} сек", remaining));
+                    countdown.set(remaining - 1);
+                    glib::ControlFlow::Continue
+                } else {
+                    // Время вышло - откатываем изменения
+                    println!("Timer expired - restoring original brightness values");
+                    
+                    let state = brightness_state_timer.borrow();
+                    let original_values = state.original_values.clone();
+                    drop(state); // Освобождаем borrow раньше
+                    
+                    // Безопасно восстанавливаем позиции слайдеров
+                    if let Ok(mut slider_refs) = slider_refs_timer.try_borrow_mut() {
+                        slider_refs.restore_all_sliders(&original_values);
+                    } else {
+                        println!("Warning: Could not restore slider positions - slider_refs is borrowed");
+                    }
+                    
+                    // Применяем исходные значения к мониторам
+                    for (&bus, &brightness) in &original_values {
+                        if let Some(display) = displays_for_timer.iter().find(|d| d.i2c_bus == bus) {
+                            let display_clone = display.clone();
+                            thread::spawn(move || {
+                                if let Err(e) = set_brightness_any_method(&display_clone, brightness) {
+                                    println!("Failed to restore brightness for {}: {}", display_clone.name, e);
+                                } else {
+                                    println!("Restored brightness {} for {}", brightness, display_clone.name);
+                                }
+                            });
+                        }
+                    }
+                    
+                    // Обновляем состояние
+                    if let Ok(mut state) = brightness_state_timer.try_borrow_mut() {
+                        state.reset_to_original();
+                    }
+                    
+                    // Скрываем панель подтверждения
+                    confirm_bar_timer.set_visible(false);
+                    
+                    // Очищаем ID таймера
+                    if let Ok(mut timer_id) = timer_source_id_timer.try_borrow_mut() {
+                        timer_id.take();
+                    }
+                    
+                    println!("Timer cleanup completed");
+                    glib::ControlFlow::Break
+                }
+            });
+            
+            *timer_source_id.borrow_mut() = Some(source_id);
+        }
+    };
+    
+    // Обработчик кнопки подтверждения
+    let confirm_handler = {
+        let brightness_state = brightness_state.clone();
+        let timer_source_id = timer_source_id.clone();
+        let confirm_bar = confirm_bar.clone();
+        
+        move |displays: Vec<DisplayInfo>| {
+            println!("Confirm button clicked - saving brightness profile");
+            
+            // Отменяем таймер
+            if let Ok(mut timer_id) = timer_source_id.try_borrow_mut() {
+                if let Some(source_id) = timer_id.take() {
+                    source_id.remove();
+                }
+            }
+            
+            let current_values = if let Ok(state) = brightness_state.try_borrow() {
+                state.current_values.clone()
+            } else {
+                println!("Warning: Could not access brightness state");
+                return;
+            };
+            
+            // Сохраняем профиль в XML
+            if let Err(e) = save_brightness_profile(&current_values, &displays) {
+                println!("Failed to save brightness profile: {}", e);
+            } else {
+                println!("Brightness profile saved successfully");
+            }
+            
+            // Подтверждаем изменения
+            if let Ok(mut state) = brightness_state.try_borrow_mut() {
+                state.confirm_changes();
+            }
+            
+            confirm_bar.set_visible(false);
+            println!("Confirm operation completed");
+        }
+    };
+    
+    // Обработчик кнопки отмены
+    let cancel_handler = {
+        let brightness_state = brightness_state.clone();
+        let slider_refs = slider_refs.clone();
+        let timer_source_id = timer_source_id.clone();
+        let confirm_bar = confirm_bar.clone();
+        
+        move |displays: Vec<DisplayInfo>| {
+            println!("Cancel button clicked - restoring original brightness values");
+            
+            // Отменяем таймер
+            if let Ok(mut timer_id) = timer_source_id.try_borrow_mut() {
+                if let Some(source_id) = timer_id.take() {
+                    source_id.remove();
+                }
+            }
+            
+            let original_values = if let Ok(state) = brightness_state.try_borrow() {
+                state.original_values.clone()
+            } else {
+                println!("Warning: Could not access brightness state");
+                return;
+            };
+            
+            // Восстанавливаем позиции слайдеров
+            if let Ok(mut slider_refs_mut) = slider_refs.try_borrow_mut() {
+                slider_refs_mut.restore_all_sliders(&original_values);
+            } else {
+                println!("Warning: Could not restore slider positions");
+            }
+            
+            // Применяем исходные значения к мониторам
+            for (&bus, &brightness) in &original_values {
+                if let Some(display) = displays.iter().find(|d| d.i2c_bus == bus) {
+                    let display_clone = display.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = set_brightness_any_method(&display_clone, brightness) {
+                            println!("Failed to restore brightness for {}: {}", display_clone.name, e);
+                        } else {
+                            println!("Restored brightness {} for {}", brightness, display_clone.name);
+                        }
+                    });
+                }
+            }
+            
+            // Обновляем состояние
+            if let Ok(mut state) = brightness_state.try_borrow_mut() {
+                state.reset_to_original();
+            }
+            
+            confirm_bar.set_visible(false);
+            println!("Cancel operation completed");
+        }
+    };
 
     let list_box_for_populate = list_box.clone();
     // Используем слабую ссылку на окно и ссылку на корневой контейнер для измерения
     let win_weak_for_measure = win.downgrade();
     let content_for_measure = vbox.clone();
+    
+    // Обработчики кнопок подтверждения (нужно подключить после создания дисплеев)
+    let confirm_handler_rc = Rc::new(RefCell::new(None::<Box<dyn Fn()>>));
+    let cancel_handler_rc = Rc::new(RefCell::new(None::<Box<dyn Fn()>>));
+    
+    // Клонируем переменные для использования в populate
+    let brightness_state_for_populate = brightness_state.clone();
+    let slider_refs_for_populate = slider_refs.clone();
+    let start_confirmation_timer_for_populate = start_confirmation_timer.clone();
+    let confirm_handler_rc_for_populate = confirm_handler_rc.clone();
+    let cancel_handler_rc_for_populate = cancel_handler_rc.clone();
+    let confirm_handler_for_populate = confirm_handler.clone();
+    let cancel_handler_for_populate = cancel_handler.clone();
+    
     let populate: Rc<dyn Fn()> = Rc::new(move || {
-        // Clear list
+        // Clear list and reset state
         while let Some(child) = list_box_for_populate.first_child() {
             list_box_for_populate.remove(&child);
         }
+        
+        // Очищаем состояние при обновлении
+        brightness_state_for_populate.borrow_mut().original_values.clear();
+        brightness_state_for_populate.borrow_mut().current_values.clear();
+        brightness_state_for_populate.borrow_mut().has_changes = false;
+        brightness_state_for_populate.borrow_mut().timer_active = false;
+        slider_refs_for_populate.borrow_mut().sliders.clear();
 
         let header = Label::new(Some("Видеокарты и мониторы"));
         header.set_xalign(0.0);
@@ -857,10 +1366,25 @@ fn build_ui(app: &Application) {
         // Клонируем ссылки для измерения, чтобы не тащить исходные и избежать move-проблем
         let win_weak_for_measure_outer = win_weak_for_measure.clone();
         let content_for_measure_outer = content_for_measure.clone();
+        
+        // Клонируем переменные для async блока
+        let brightness_state_for_async = brightness_state_for_populate.clone();
+        let slider_refs_for_async = slider_refs_for_populate.clone();
+        let start_timer_for_async = start_confirmation_timer_for_populate.clone();
+        let confirm_handler_rc_for_async = confirm_handler_rc_for_populate.clone();
+        let cancel_handler_rc_for_async = cancel_handler_rc_for_populate.clone();
+        let confirm_handler_for_async = confirm_handler_for_populate.clone();
+        let cancel_handler_for_async = cancel_handler_for_populate.clone();
+        
         glib::spawn_future_local(async move {
             if let Ok(msg) = rx.recv().await {
                 match msg {
                     Ok(cards) if !cards.is_empty() => {
+                        // Собираем все дисплеи для использования в callbacks
+                        let all_displays: Vec<DisplayInfo> = cards.iter()
+                            .flat_map(|card| card.displays.iter())
+                            .cloned()
+                            .collect();
                         for card in cards {
                             // Add card header
                             let card_header = Label::new(Some(&card.name));
@@ -1003,6 +1527,9 @@ fn build_ui(app: &Application) {
                                 });
                                 
                                 let grid_for_tooltip = grid.clone();
+                                let brightness_state_for_init = brightness_state_for_async.clone();
+                                let bus_for_init = d.i2c_bus;
+                                let slider_refs_for_init = slider_refs_for_async.clone();
                                 glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl => async move {
                                     if let Ok(res) = s_rx.recv().await {
                                         match res {
@@ -1010,6 +1537,12 @@ fn build_ui(app: &Application) {
                                                 scale.set_value(v as f64);
                                                 scale.set_sensitive(true);
                                                 value_lbl.set_text(&format!("{}%", v));
+                                                
+                                                // Регистрируем слайдер в SliderRefs
+                                                slider_refs_for_init.borrow_mut().add_slider(bus_for_init, scale.clone(), value_lbl.clone());
+                                                
+                                                // Сохраняем исходное значение после получения реального значения
+                                                brightness_state_for_init.borrow_mut().save_original(bus_for_init, v);
                                             }
                                             Err(e) => {
                                                 scale.set_sensitive(false);
@@ -1028,14 +1561,43 @@ fn build_ui(app: &Application) {
                                 println!("Creating callback for: {} (bus {}) [index: {}]", d.name, d.i2c_bus, display_index);
                                 
                                 let value_lbl_for_change = value_lbl.clone();
+                                let brightness_state_for_callback = brightness_state_for_async.clone();
+                                let slider_refs_for_callback = slider_refs_for_async.clone();
+                                let start_timer_for_callback = start_timer_for_async.clone();
+                                let all_displays_for_callback = all_displays.clone();
+                                
                                 scale.connect_value_changed(move |s| {
                                     let val = s.value() as u8;
-                                    value_lbl_for_change.set_text(&format!("{}%", val));
                                     let display_clone = display_info_for_callback.clone();
+                                    
+                                    // Проверяем, является ли это программным обновлением
+                                    if let Ok(mut slider_refs_mut) = slider_refs_for_callback.try_borrow_mut() {
+                                        if slider_refs_mut.is_programmatic_update(display_clone.i2c_bus) {
+                                            // Это программное обновление - просто обновляем метку и выходим
+                                            value_lbl_for_change.set_text(&format!("{}%", val));
+                                            return;
+                                        }
+                                    } else {
+                                        // Если не можем получить мутабельную ссылку, значит идет восстановление
+                                        // Просто обновляем метку и выходим
+                                        value_lbl_for_change.set_text(&format!("{}%", val));
+                                        return;
+                                    }
+                                    
+                                    value_lbl_for_change.set_text(&format!("{}%", val));
                                     let callback_id = format!("{}_{}_bus{}", display_clone.name, display_index, display_clone.i2c_bus);
                                     
                                     println!("CALLBACK {}: Setting brightness {} for display: {} (bus {})", 
                                         callback_id, val, display_clone.name, display_clone.i2c_bus);
+                                    
+                                    // Обновляем состояние
+                                    let (has_changes, _timer_active) = if let Ok(mut state) = brightness_state_for_callback.try_borrow_mut() {
+                                        state.update_current(display_clone.i2c_bus, val);
+                                        (state.has_changes, state.timer_active)
+                                    } else {
+                                        println!("Warning: Could not update brightness state");
+                                        (false, false)
+                                    };
                                     
                                     // Set brightness immediately in background thread
                                     thread::spawn(move || {
@@ -1045,6 +1607,11 @@ fn build_ui(app: &Application) {
                                             println!("Successfully set brightness {} for {}", val, display_clone.name);
                                         }
                                     });
+                                    
+                                    // Перезапускаем таймер подтверждения при каждом изменении
+                                    if has_changes {
+                                        start_timer_for_callback(all_displays_for_callback.clone());
+                                    }
                                 });
                             }
                             
@@ -1062,6 +1629,19 @@ fn build_ui(app: &Application) {
                             separator.set_margin_bottom(8);
                             list_box_target.append(&separator);
                         }
+
+                        // Устанавливаем обработчики кнопок подтверждения
+                        *confirm_handler_rc_for_async.borrow_mut() = Some(Box::new({
+                            let all_displays = all_displays.clone();
+                            let confirm_handler = confirm_handler_for_async.clone();
+                            move || confirm_handler(all_displays.clone())
+                        }));
+                        
+                        *cancel_handler_rc_for_async.borrow_mut() = Some(Box::new({
+                            let all_displays = all_displays.clone();
+                            let cancel_handler = cancel_handler_for_async.clone();
+                            move || cancel_handler(all_displays.clone())
+                        }));
 
                         // После полного наполнения списка — один раз подстроим окно под контент
                         let win_weak_local = win_weak_for_measure_outer.clone();
@@ -1092,6 +1672,20 @@ fn build_ui(app: &Application) {
 
     // Initial population
     populate();
+
+    let confirm_handler_for_button = confirm_handler_rc.clone();
+    confirm_button.connect_clicked(move |_| {
+        if let Some(ref handler) = *confirm_handler_for_button.borrow() {
+            handler();
+        }
+    });
+    
+    let cancel_handler_for_button = cancel_handler_rc.clone();
+    cancel_button.connect_clicked(move |_| {
+        if let Some(ref handler) = *cancel_handler_for_button.borrow() {
+            handler();
+        }
+    });
 
     // Refresh button
     let populate_btn = populate.clone();
