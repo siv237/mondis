@@ -18,3 +18,5 @@ async-channel = "2.0"
 hex = "0.4"
 # XML and file operations
 serde = { version = "1.0", features = ["derive"] }
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }

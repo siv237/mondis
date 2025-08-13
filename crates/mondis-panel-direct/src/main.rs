@@ -1,6 +1,6 @@
 use anyhow::Result;
 use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, Scale, Separator, Button, HeaderBar, CssProvider, Image};
+use gtk::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, Scale, Separator, Button, HeaderBar, CssProvider, Image, Window, Notebook, ScrolledWindow, TextView, TextBuffer, GestureClick, WrapMode, PolicyType};
 use gtk::gdk::Display as GdkDisplay;
 use tracing_subscriber::EnvFilter;
 use glib::clone;
@@ -119,6 +119,22 @@ fn setup_styles() {
         background: alpha(@warning_color_dark, 0.1);
         border-color: alpha(@warning_color_dark, 0.3);
     }
+    
+    /* Стили для кликабельных карточек */
+    .clickable-card {
+        cursor: pointer;
+        transition: all 200ms ease;
+    }
+    .clickable-card:hover {
+        background-color: alpha(@theme_selected_bg_color, 0.1);
+        border-color: alpha(@theme_selected_bg_color, 0.3);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px alpha(@theme_fg_color, 0.1);
+    }
+    .clickable-card:active {
+        transform: translateY(0px);
+        box-shadow: 0 2px 4px alpha(@theme_fg_color, 0.1);
+    }
     "#;
 
     let provider = CssProvider::new();
@@ -160,6 +176,58 @@ struct DisplayInfo {
 struct VideoCard {
     name: String,
     displays: Vec<DisplayInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct MonitorDetails {
+    // EDID информация
+    manufacturer: String,
+    model: String,
+    serial_number: Option<String>,
+    manufacture_year: Option<u16>,
+    manufacture_week: Option<u8>,
+    edid_version: Option<String>,
+    video_input: Option<String>,
+    color_space: Option<String>,
+    resolution: Option<String>,
+    physical_size: Option<String>, // размер в мм
+    aspect_ratio: Option<String>,
+    
+    // DDC/CI возможности
+    mccs_version: Option<String>,
+    controller_mfg: Option<String>,
+    firmware_version: Option<String>,
+    supported_vcp_codes: Vec<u8>,
+    capabilities_string: Option<String>, // полная строка capabilities
+    
+    // Текущие настройки
+    current_brightness: Option<u8>,
+    current_contrast: Option<u8>,
+    current_color_temp: Option<String>,
+    current_input_source: Option<String>,
+    current_volume: Option<u8>,
+    current_power_state: Option<String>,
+    
+    // Дополнительные VCP значения
+    red_gain: Option<u8>,
+    green_gain: Option<u8>,
+    blue_gain: Option<u8>,
+    backlight_control: Option<u8>,
+    osd_language: Option<String>,
+    
+    // Технические детали
+    i2c_bus: String,
+    drm_connector: Option<String>,
+    driver: Option<String>,
+    pci_path: Option<String>,
+    device_path: Option<String>,
+    
+    // EDID hex dump
+    edid_hex: Option<String>,
+    
+    // Статистика
+    read_errors: u32,
+    last_update: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +386,1364 @@ fn save_brightness_profile(brightness_values: &HashMap<u8, u8>, displays: &[Disp
     
     println!("Brightness profile saved to: {:?}", profile_path);
     Ok(())
+}
+
+fn read_edid_directly(i2c_bus: u8) -> Result<Vec<u8>, String> {
+    let device_path = format!("/dev/i2c-{}", i2c_bus);
+    println!("    Opening I2C device: {}", device_path);
+    
+    let mut dev = LinuxI2CDevice::new(&device_path, 0x50)
+        .map_err(|e| format!("Failed to open {} for EDID: {}", device_path, e))?;
+    
+    println!("    Writing EDID offset 0x00...");
+    // Записываем offset 0x00
+    dev.write(&[0x00])
+        .map_err(|e| format!("Failed to write EDID offset: {}", e))?;
+    
+    thread::sleep(Duration::from_millis(10));
+    
+    println!("    Reading 128 bytes of EDID data...");
+    // Читаем EDID (128 байт базовый блок)
+    let mut edid_data = vec![0u8; 128];
+    dev.read(&mut edid_data)
+        .map_err(|e| format!("Failed to read EDID: {}", e))?;
+    
+    println!("    Validating EDID header...");
+    // Проверяем заголовок EDID
+    if edid_data.len() >= 8 && edid_data[0] == 0x00 && edid_data[1] == 0xFF && edid_data[7] == 0x00 {
+        println!("    EDID header is valid");
+        Ok(edid_data)
+    } else {
+        Err(format!("Invalid EDID header: {:02X} {:02X} ... {:02X}", 
+            edid_data[0], edid_data[1], edid_data[7]))
+    }
+}
+
+fn parse_edid_detailed(edid_data: &[u8]) -> (Option<String>, Option<String>, Option<u16>, Option<u8>, Option<String>, Option<String>, Option<String>, Option<String>) {
+    if edid_data.len() < 128 {
+        return (None, None, None, None, None, None, None, None);
+    }
+    
+    // Manufacturer ID (bytes 8-9)
+    let mfg_id = u16::from_be_bytes([edid_data[8], edid_data[9]]);
+    let c1 = (((mfg_id >> 10) & 0x1F) as u8 + 0x40) as char;
+    let c2 = (((mfg_id >> 5) & 0x1F) as u8 + 0x40) as char;
+    let c3 = ((mfg_id & 0x1F) as u8 + 0x40) as char;
+    let manufacturer = if c1.is_ascii_uppercase() && c2.is_ascii_uppercase() && c3.is_ascii_uppercase() {
+        Some(format!("{}{}{}", c1, c2, c3))
+    } else { 
+        None 
+    };
+    
+    // Год производства (byte 17) + 1990
+    let manufacture_year = if edid_data[17] > 0 {
+        Some(edid_data[17] as u16 + 1990)
+    } else {
+        None
+    };
+    
+    // Неделя производства (byte 16)
+    let manufacture_week = if edid_data[16] > 0 && edid_data[16] <= 54 {
+        Some(edid_data[16])
+    } else {
+        None
+    };
+    
+    // EDID версия (bytes 18-19)
+    let edid_version = Some(format!("{}.{}", edid_data[18], edid_data[19]));
+    
+    // Физический размер (bytes 21-22) в см
+    let physical_size = if edid_data[21] > 0 && edid_data[22] > 0 {
+        let width_cm = edid_data[21];
+        let height_cm = edid_data[22];
+        Some(format!("{} x {} см", width_cm, height_cm))
+    } else {
+        None
+    };
+    
+    // Разрешение из первого detailed timing descriptor (bytes 54-71)
+    let resolution = if edid_data.len() >= 72 {
+        let h_active = ((edid_data[58] as u16) << 4) | ((edid_data[62] as u16 >> 4) & 0x0F);
+        let v_active = ((edid_data[61] as u16) << 4) | (edid_data[62] as u16 & 0x0F);
+        if h_active > 0 && v_active > 0 {
+            Some(format!("{} x {}", h_active, v_active))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    // Соотношение сторон
+    let aspect_ratio = if let Some(ref _size) = physical_size {
+        if edid_data[21] > 0 && edid_data[22] > 0 {
+            let ratio = edid_data[21] as f32 / edid_data[22] as f32;
+            if (ratio - 16.0/9.0).abs() < 0.1 {
+                Some("16:9".to_string())
+            } else if (ratio - 16.0/10.0).abs() < 0.1 {
+                Some("16:10".to_string())
+            } else if (ratio - 4.0/3.0).abs() < 0.1 {
+                Some("4:3".to_string())
+            } else if (ratio - 21.0/9.0).abs() < 0.1 {
+                Some("21:9".to_string())
+            } else {
+                Some(format!("{:.2}:1", ratio))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    // Ищем название модели в дескрипторах (bytes 54-125)
+    let mut model_name = None;
+    for i in (54..126).step_by(18) {
+        if edid_data[i] == 0x00 && edid_data[i+1] == 0x00 && edid_data[i+2] == 0x00 && edid_data[i+3] == 0xFC {
+            // Monitor name descriptor
+            let name_bytes = &edid_data[i+5..i+18];
+            let name = String::from_utf8_lossy(name_bytes)
+                .trim_end_matches('\0')
+                .trim_end_matches('\n')
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                model_name = Some(name);
+                break;
+            }
+        }
+    }
+    
+    (manufacturer, model_name, manufacture_year, manufacture_week, edid_version, physical_size, resolution, aspect_ratio)
+}
+
+fn read_ddc_capabilities(i2c_bus: u8) -> Result<String, String> {
+    let device_path = format!("/dev/i2c-{}", i2c_bus);
+    println!("    Opening DDC device: {}", device_path);
+    
+    let mut dev = LinuxI2CDevice::new(&device_path, 0x37)
+        .map_err(|e| format!("Failed to open {} for DDC: {}", device_path, e))?;
+    
+    // DDC Get Capabilities request: [source_addr, length, type]
+    let request = [0x51, 0x01, 0xF3]; // F3 = Capabilities Request
+    let checksum = 0x6E ^ request.iter().fold(0u8, |acc, &x| acc ^ x);
+    let full_request = [request[0], request[1], request[2], checksum];
+    
+    println!("    Sending capabilities request: {:02X?}", full_request);
+    dev.write(&full_request)
+        .map_err(|e| format!("Failed to write DDC capabilities request: {}", e))?;
+    
+    println!("    Waiting 200ms for response...");
+    thread::sleep(Duration::from_millis(200)); // Больше времени для capabilities
+    
+    // Читаем ответ (простое чтение, не multi-part)
+    let mut response = vec![0u8; 256];
+    dev.read(&mut response)
+        .map_err(|e| format!("Failed to read DDC capabilities response: {}", e))?;
+    
+    println!("    Received {} bytes: {:02X?}", response.len(), &response[..std::cmp::min(16, response.len())]);
+    
+    // Проверяем заголовок ответа
+    if response.len() < 4 || response[0] != 0x6E {
+        return Err(format!("Invalid DDC response header: 0x{:02X}", response.get(0).unwrap_or(&0)));
+    }
+    
+    let data_len = response[1] as usize;
+    if data_len == 0 || data_len + 3 > response.len() {
+        return Err(format!("Invalid capabilities response length: {} (buffer size: {})", data_len, response.len()));
+    }
+    
+    // Извлекаем данные (пропускаем заголовок и checksum)
+    let data_start = 3;
+    let data_end = std::cmp::min(data_start + data_len - 1, response.len() - 1); // -1 для checksum
+    
+    let mut all_data = Vec::new();
+    if data_end > data_start {
+        all_data.extend_from_slice(&response[data_start..data_end]);
+    }
+    
+    if all_data.is_empty() {
+        return Err("No capabilities data received".to_string());
+    }
+    
+    // Очищаем данные от мусора
+    let mut clean_data = Vec::new();
+    for &byte in &all_data {
+        if byte >= 0x20 && byte <= 0x7E { // Печатные ASCII символы
+            clean_data.push(byte);
+        } else if byte == 0x00 {
+            break; // Конец строки
+        }
+    }
+    
+    let caps_string = String::from_utf8_lossy(&clean_data).trim().to_string();
+    println!("    Parsed capabilities string ({} chars): {}", caps_string.len(), caps_string);
+    
+    if caps_string.is_empty() {
+        Err("Empty capabilities string".to_string())
+    } else {
+        Ok(caps_string)
+    }
+}
+
+fn read_vcp_value(i2c_bus: u8, vcp_code: u8) -> Result<(u8, u8), String> {
+    let device_path = format!("/dev/i2c-{}", i2c_bus);
+    let mut dev = LinuxI2CDevice::new(&device_path, 0x37)
+        .map_err(|e| format!("Failed to open {} for DDC: {}", device_path, e))?;
+    
+    // DDC Get VCP request: [source_addr, length, type, vcp_code]
+    let request = [0x51, 0x02, 0x01, vcp_code];
+    let checksum = 0x6E ^ request.iter().fold(0u8, |acc, &x| acc ^ x);
+    let full_request = [request[0], request[1], request[2], request[3], checksum];
+    
+    dev.write(&full_request)
+        .map_err(|e| format!("Failed to write DDC VCP request: {}", e))?;
+    
+    thread::sleep(Duration::from_millis(50));
+    
+    // Читаем ответ: [dest, length, type, result, vcp_code, type_flag, max_hi, max_lo, cur_hi, cur_lo, checksum]
+    let mut response = [0u8; 12];
+    dev.read(&mut response)
+        .map_err(|e| format!("Failed to read DDC VCP response: {}", e))?;
+    
+    if response.len() >= 10 && response[4] == vcp_code {
+        let current_value = ((response[8] as u16) << 8) | (response[9] as u16);
+        let max_value = ((response[6] as u16) << 8) | (response[7] as u16);
+        Ok((current_value as u8, max_value as u8))
+    } else {
+        Err(format!("Invalid VCP response: expected code 0x{:02X}, got 0x{:02X} (response: {:02X?})", 
+            vcp_code, response[4], &response[..std::cmp::min(12, response.len())]))
+    }
+}
+
+fn get_monitor_details(display: &DisplayInfo) -> Result<MonitorDetails, String> {
+    let mut details = MonitorDetails {
+        manufacturer: display.manufacturer.clone().unwrap_or_default(),
+        model: display.model.clone().unwrap_or_default(),
+        serial_number: display.serial.clone(),
+        manufacture_year: None,
+        manufacture_week: None,
+        edid_version: None,
+        video_input: None,
+        color_space: None,
+        resolution: None,
+        physical_size: None,
+        aspect_ratio: None,
+        mccs_version: None,
+        controller_mfg: None,
+        firmware_version: None,
+        supported_vcp_codes: Vec::new(),
+        capabilities_string: None,
+        current_brightness: None,
+        current_contrast: None,
+        current_color_temp: None,
+        current_input_source: None,
+        current_volume: None,
+        current_power_state: None,
+        red_gain: None,
+        green_gain: None,
+        blue_gain: None,
+        backlight_control: None,
+        osd_language: None,
+        i2c_bus: format!("/dev/i2c-{}", display.i2c_bus),
+        drm_connector: display.connector.clone(),
+        driver: None,
+        pci_path: None,
+        device_path: None,
+        edid_hex: None,
+        read_errors: 0,
+        last_update: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+    };
+    
+    println!("=== Getting detailed info for bus {} using direct I2C access ===", display.i2c_bus);
+    
+    // Читаем EDID напрямую
+    println!("Step 1: Reading EDID from /dev/i2c-{} at address 0x50...", display.i2c_bus);
+    match read_edid_directly(display.i2c_bus) {
+        Ok(edid_data) => {
+            println!("✅ Successfully read EDID ({} bytes)", edid_data.len());
+            println!("EDID header: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}", 
+                edid_data[0], edid_data[1], edid_data[2], edid_data[3], 
+                edid_data[4], edid_data[5], edid_data[6], edid_data[7]);
+        
+            // Парсим детальную информацию из EDID
+            println!("Step 2: Parsing EDID data...");
+            let (mfg, model, year, week, version, physical_size, resolution, aspect_ratio) = parse_edid_detailed(&edid_data);
+            
+            println!("Parsed EDID info:");
+            if let Some(ref mfg) = mfg {
+                println!("  - Manufacturer: {}", mfg);
+                details.manufacturer = mfg.clone();
+            } else {
+                println!("  - Manufacturer: Not found");
+            }
+            
+            if let Some(ref model) = model {
+                println!("  - Model: {}", model);
+                details.model = model.clone();
+            } else {
+                println!("  - Model: Not found");
+            }
+            
+            if let Some(year) = year {
+                println!("  - Year: {}", year);
+                details.manufacture_year = Some(year);
+            } else {
+                println!("  - Year: Not found");
+            }
+            
+            if let Some(week) = week {
+                println!("  - Week: {}", week);
+                details.manufacture_week = Some(week);
+            } else {
+                println!("  - Week: Not found");
+            }
+            
+            if let Some(ref version) = version {
+                println!("  - EDID Version: {}", version);
+                details.edid_version = Some(version.clone());
+            } else {
+                println!("  - EDID Version: Not found");
+                details.edid_version = version;
+            }
+            
+            if let Some(ref size) = physical_size {
+                println!("  - Physical Size: {}", size);
+                details.physical_size = Some(size.clone());
+            }
+            
+            if let Some(ref res) = resolution {
+                println!("  - Resolution: {}", res);
+                details.resolution = Some(res.clone());
+            }
+            
+            if let Some(ref ratio) = aspect_ratio {
+                println!("  - Aspect Ratio: {}", ratio);
+                details.aspect_ratio = Some(ratio.clone());
+            }
+        
+            // Определяем тип входа из EDID
+            if edid_data.len() > 20 {
+                let video_input = edid_data[20];
+                let input_type = if video_input & 0x80 != 0 {
+                    format!("Digital Input (0x{:02X})", video_input)
+                } else {
+                    format!("Analog Input (0x{:02X})", video_input)
+                };
+                println!("  - Video Input: {}", input_type);
+                details.video_input = Some(input_type);
+            }
+        
+        // Создаем hex dump
+        let hex_dump = edid_data.chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let hex_part = chunk.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii_part = chunk.iter()
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect::<String>();
+                format!("  +{:04x}   {:<47} {}", i * 16, hex_part, ascii_part)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+            details.edid_hex = Some(format!("          +0          +4          +8          +c            0   4   8   c\n{}", hex_dump));
+            println!("  - EDID Hex dump: {} lines generated", hex_dump.lines().count());
+        }
+        Err(e) => {
+            println!("❌ Failed to read EDID directly: {}", e);
+        }
+    }
+    
+    // Получаем DDC/CI информацию если поддерживается
+    if display.supports_ddc {
+        println!("\nStep 3: Getting DDC/CI capabilities for bus {}...", display.i2c_bus);
+        
+        // Читаем capabilities напрямую
+        match read_ddc_capabilities(display.i2c_bus) {
+            Ok(caps_string) => {
+                println!("✅ Successfully read capabilities ({} chars): {}", caps_string.len(), caps_string);
+                details.capabilities_string = Some(caps_string.clone());
+            
+                // Парсим capabilities string для извлечения информации
+                println!("Parsing capabilities string...");
+                
+                // MCCS версия
+                if caps_string.contains("mccs_ver(") {
+                    if let Some(start) = caps_string.find("mccs_ver(") {
+                        if let Some(end) = caps_string[start..].find(')') {
+                            let version = &caps_string[start+9..start+end];
+                            println!("  - MCCS Version: {}", version);
+                            details.mccs_version = Some(version.to_string());
+                        }
+                    }
+                } else {
+                    println!("  - MCCS Version: Not found in capabilities");
+                }
+                
+                // Модель из capabilities
+                if caps_string.contains("model(") {
+                    if let Some(start) = caps_string.find("model(") {
+                        if let Some(end) = caps_string[start..].find(')') {
+                            let model = &caps_string[start+6..start+end];
+                            println!("  - Model from capabilities: {}", model);
+                            if details.model.is_empty() {
+                                details.model = model.to_string();
+                            }
+                        }
+                    }
+                }
+                
+                // Тип монитора
+                if caps_string.contains("type(") {
+                    if let Some(start) = caps_string.find("type(") {
+                        if let Some(end) = caps_string[start..].find(')') {
+                            let monitor_type = &caps_string[start+5..start+end];
+                            println!("  - Monitor Type: {}", monitor_type);
+                            details.color_space = Some(monitor_type.to_string());
+                        }
+                    }
+                }
+                
+                // Извлекаем поддерживаемые VCP коды из vcp() секции
+                let mut vcp_codes = Vec::new();
+                if let Some(vcp_start) = caps_string.find("vcp(") {
+                    if let Some(vcp_end) = caps_string[vcp_start..].find(')') {
+                        let vcp_section = &caps_string[vcp_start+4..vcp_start+vcp_end];
+                        
+                        // Парсим VCP коды (могут быть в формате "10 12 14(05 06 08)")
+                        for part in vcp_section.split_whitespace() {
+                            let code_part = part.split('(').next().unwrap_or(part);
+                            if code_part.len() == 2 {
+                                if let Ok(code) = u8::from_str_radix(code_part, 16) {
+                                    vcp_codes.push(code);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                println!("  - Found {} VCP codes: {:02X?}", vcp_codes.len(), vcp_codes);
+                details.supported_vcp_codes = vcp_codes;
+            }
+            Err(e) => {
+                println!("❌ Failed to read DDC capabilities: {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Читаем текущие значения VCP кодов
+        println!("\nStep 4: Reading current VCP values...");
+        
+        // Яркость (0x10)
+        print!("  - Reading brightness (VCP 0x10)... ");
+        match read_vcp_value(display.i2c_bus, 0x10) {
+            Ok((current, max_val)) => {
+                println!("✅ {}/{}", current, max_val);
+                details.current_brightness = Some(current);
+            }
+            Err(e) => println!("❌ {}", e),
+        }
+        
+        // Контраст (0x12)
+        print!("  - Reading contrast (VCP 0x12)... ");
+        match read_vcp_value(display.i2c_bus, 0x12) {
+            Ok((current, max_val)) => {
+                println!("✅ {}/{}", current, max_val);
+                details.current_contrast = Some(current);
+            }
+            Err(e) => println!("❌ {}", e),
+        }
+        
+        // Источник входа (0x60)
+        print!("  - Reading input source (VCP 0x60)... ");
+        match read_vcp_value(display.i2c_bus, 0x60) {
+            Ok((current, _max)) => {
+                let input_name = match current {
+                    0x0F => "DisplayPort-1",
+                    0x11 => "HDMI-1",
+                    0x12 => "HDMI-2",
+                    _ => "Unknown",
+                };
+                println!("✅ {} (0x{:02X})", input_name, current);
+                details.current_input_source = Some(format!("{} (0x{:02X})", input_name, current));
+            }
+            Err(e) => println!("❌ {}", e),
+        }
+        
+        // Громкость (0x62)
+        print!("  - Reading volume (VCP 0x62)... ");
+        match read_vcp_value(display.i2c_bus, 0x62) {
+            Ok((current, max_val)) => {
+                println!("✅ {}/{}", current, max_val);
+                details.current_volume = Some(current);
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Дополнительные VCP коды
+        
+        // Красный канал (0x16)
+        print!("  - Reading red gain (VCP 0x16)... ");
+        match read_vcp_value(display.i2c_bus, 0x16) {
+            Ok((current, _max)) => {
+                println!("✅ {}", current);
+                details.red_gain = Some(current);
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Зеленый канал (0x18)
+        print!("  - Reading green gain (VCP 0x18)... ");
+        match read_vcp_value(display.i2c_bus, 0x18) {
+            Ok((current, _max)) => {
+                println!("✅ {}", current);
+                details.green_gain = Some(current);
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Синий канал (0x1A)
+        print!("  - Reading blue gain (VCP 0x1A)... ");
+        match read_vcp_value(display.i2c_bus, 0x1A) {
+            Ok((current, _max)) => {
+                println!("✅ {}", current);
+                details.blue_gain = Some(current);
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Управление подсветкой (0x13)
+        print!("  - Reading backlight control (VCP 0x13)... ");
+        match read_vcp_value(display.i2c_bus, 0x13) {
+            Ok((current, _max)) => {
+                println!("✅ {}", current);
+                details.backlight_control = Some(current);
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Состояние питания (0xD6)
+        print!("  - Reading power state (VCP 0xD6)... ");
+        match read_vcp_value(display.i2c_bus, 0xD6) {
+            Ok((current, _max)) => {
+                let power_state = match current {
+                    0x01 => "On",
+                    0x02 => "Standby",
+                    0x03 => "Suspend",
+                    0x04 => "Off (Soft)",
+                    0x05 => "Off (Hard)",
+                    _ => "Unknown",
+                };
+                println!("✅ {} (0x{:02X})", power_state, current);
+                details.current_power_state = Some(format!("{} (0x{:02X})", power_state, current));
+            }
+            Err(e) => {
+                println!("❌ {}", e);
+                details.read_errors += 1;
+            }
+        }
+    } else {
+        println!("\nStep 3: DDC not supported for bus {}, skipping DDC/CI info", display.i2c_bus);
+    }
+    
+    // Получаем системную информацию
+    println!("\nStep 5: Getting system information...");
+    
+    // Сохраняем путь к устройству I2C
+    details.device_path = Some(format!("/dev/i2c-{}", display.i2c_bus));
+    
+    if let Some(ref connector) = display.connector {
+        println!("  - Connector: {}", connector);
+        details.drm_connector = Some(connector.clone());
+        
+        // Извлекаем информацию о драйвере из sysfs
+        let card_num = if connector.starts_with("card") {
+            connector.chars().nth(4).and_then(|c| c.to_digit(10)).unwrap_or(0) as u8
+        } else {
+            0
+        };
+        
+        let device_path = format!("/sys/class/drm/card{}/device", card_num);
+        println!("  - Device path: {}", device_path);
+        
+        // Читаем драйвер
+        match std::fs::read_to_string(format!("{}/driver/module/name", device_path)) {
+            Ok(driver_name) => {
+                let driver = driver_name.trim().to_string();
+                println!("  - Driver: {}", driver);
+                details.driver = Some(driver);
+            }
+            Err(e) => {
+                println!("  - Driver: Failed to read ({})", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Читаем PCI путь
+        match std::fs::read_link(&device_path) {
+            Ok(pci_path) => {
+                let pci_path_str = format!("/sys/devices{}", pci_path.to_string_lossy());
+                println!("  - PCI path: {}", pci_path_str);
+                details.pci_path = Some(pci_path_str);
+            }
+            Err(e) => {
+                println!("  - PCI path: Failed to read ({})", e);
+                details.read_errors += 1;
+            }
+        }
+        
+        // Читаем vendor и device ID
+        if let Ok(vendor_id) = std::fs::read_to_string(format!("{}/vendor", device_path)) {
+            if let Ok(device_id) = std::fs::read_to_string(format!("{}/device", device_path)) {
+                let vendor = vendor_id.trim();
+                let device = device_id.trim();
+                println!("  - PCI ID: {}:{}", vendor, device);
+                
+                // Добавляем к информации о контроллере
+                if details.controller_mfg.is_none() {
+                    details.controller_mfg = Some(format!("PCI {}:{}", vendor, device));
+                }
+            }
+        }
+        
+        // Читаем состояние подключения
+        if let Ok(status) = std::fs::read_to_string(format!("/sys/class/drm/{}/status", connector)) {
+            let status = status.trim();
+            println!("  - Connection Status: {}", status);
+        }
+        
+        // Читаем DPMS состояние
+        if let Ok(dpms) = std::fs::read_to_string(format!("/sys/class/drm/{}/dpms", connector)) {
+            let dpms = dpms.trim();
+            println!("  - DPMS State: {}", dpms);
+            if details.current_power_state.is_none() {
+                details.current_power_state = Some(format!("DPMS: {}", dpms));
+            }
+        }
+        
+    } else {
+        println!("  - No connector information available");
+        details.read_errors += 1;
+    }
+    
+    println!("\n=== Monitor details collection completed ===");
+    
+    Ok(details)
+}
+
+fn parse_ddcutil_detect_output(output: &str, details: &mut MonitorDetails) {
+    for line in output.lines() {
+        let line = line.trim();
+        
+        if line.starts_with("Driver:") {
+            details.driver = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("PCI device path:") {
+            details.pci_path = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Manufacture year:") {
+            if let Some(year_part) = line.split(':').nth(1) {
+                if let Some(year_str) = year_part.split(',').next() {
+                    details.manufacture_year = year_str.trim().parse().ok();
+                }
+                if let Some(week_part) = year_part.split("Week:").nth(1) {
+                    details.manufacture_week = week_part.trim().parse().ok();
+                }
+            }
+        } else if line.starts_with("EDID version:") {
+            details.edid_version = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Video input definition:") {
+            details.video_input = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Standard sRGB color space:") {
+            let srgb = line.split(':').nth(1).map(|s| s.trim()).unwrap_or("Unknown");
+            details.color_space = Some(format!("sRGB: {}", srgb));
+        }
+    }
+    
+    // Извлекаем EDID hex dump
+    if let Some(hex_start) = output.find("EDID hex dump:") {
+        let hex_section = &output[hex_start..];
+        let mut hex_lines = Vec::new();
+        
+        for line in hex_section.lines().skip(2) { // Пропускаем заголовок
+            if line.trim().is_empty() || !line.contains("+") {
+                break;
+            }
+            hex_lines.push(line.to_string());
+        }
+        
+        if !hex_lines.is_empty() {
+            details.edid_hex = Some(hex_lines.join("\n"));
+        }
+    }
+}
+
+fn parse_ddcutil_capabilities(output: &str, details: &mut MonitorDetails) {
+    for line in output.lines() {
+        let line = line.trim();
+        
+        if line.starts_with("MCCS version:") {
+            details.mccs_version = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("VCP version:") {
+            details.mccs_version = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Controller mfg:") {
+            details.controller_mfg = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Firmware version:") {
+            details.firmware_version = line.split(':').nth(1).map(|s| s.trim().to_string());
+        } else if line.starts_with("Feature:") {
+            // Парсим VCP коды: "Feature: 10 (Brightness)"
+            if let Some(code_part) = line.split(':').nth(1) {
+                if let Some(code_str) = code_part.split('(').next() {
+                    if let Ok(code) = u8::from_str_radix(code_str.trim(), 16) {
+                        details.supported_vcp_codes.push(code);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn get_current_vcp_values(bus: u8, details: &mut MonitorDetails) {
+    // Получаем яркость (VCP 0x10)
+    if let Ok(brightness) = ddc_get_brightness(bus) {
+        details.current_brightness = Some(brightness);
+    }
+    
+    // Получаем другие параметры через ddcutil getvcp
+    let vcp_codes = vec![
+        (0x12, "contrast"),
+        (0x14, "color_temp"),
+        (0x60, "input_source"),
+        (0x62, "volume"),
+    ];
+    
+    for (code, param_type) in vcp_codes {
+        if let Ok(output) = Command::new("ddcutil")
+            .arg("getvcp")
+            .arg(format!("{:02x}", code))
+            .arg("--bus")
+            .arg(bus.to_string())
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_vcp_value(&stdout, param_type, details);
+        }
+    }
+}
+
+fn parse_vcp_value(output: &str, param_type: &str, details: &mut MonitorDetails) {
+    for line in output.lines() {
+        if line.contains("current value") {
+            match param_type {
+                "contrast" => {
+                    if let Some(value) = extract_current_value(line) {
+                        details.current_contrast = Some(value);
+                    }
+                }
+                "color_temp" => {
+                    // Парсим цветовую температуру: "6500 K (0x05)"
+                    if let Some(temp_part) = line.split(':').nth(1) {
+                        if let Some(temp_str) = temp_part.split('(').next() {
+                            details.current_color_temp = Some(temp_str.trim().to_string());
+                        }
+                    }
+                }
+                "input_source" => {
+                    if let Some(source_part) = line.split(':').nth(1) {
+                        if let Some(source_str) = source_part.split('(').next() {
+                            details.current_input_source = Some(source_str.trim().to_string());
+                        }
+                    }
+                }
+                "volume" => {
+                    if let Some(value) = extract_current_value(line) {
+                        details.current_volume = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn extract_current_value(line: &str) -> Option<u8> {
+    if let Some(value_part) = line.split("current value =").nth(1) {
+        if let Some(value_str) = value_part.split(',').next() {
+            return value_str.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn show_monitor_details_dialog(parent: &ApplicationWindow, display: &DisplayInfo) {
+    let dialog = Window::builder()
+        .title(&format!("Подробности: {}", display.name))
+        .transient_for(parent)
+        .modal(false)  // Делаем немодальным для лучшего UX
+        .default_width(1000)
+        .default_height(800)
+        .resizable(true)  // Разрешаем изменение размера
+        .build();
+    
+    // Создаем основной контейнер
+    let vbox = GtkBox::new(Orientation::Vertical, 0);
+    
+    // Создаем notebook с вкладками
+    let notebook = Notebook::new();
+    notebook.set_margin_top(12);
+    notebook.set_margin_bottom(12);
+    notebook.set_margin_start(12);
+    notebook.set_margin_end(12);
+    notebook.set_vexpand(true);
+    notebook.set_hexpand(true);
+    
+    // Показываем индикатор загрузки
+    let loading_label = Label::new(Some("Загрузка информации..."));
+    loading_label.set_margin_top(50);
+    loading_label.set_margin_bottom(50);
+    
+    vbox.append(&loading_label);
+    dialog.set_child(Some(&vbox));
+    
+    // Получаем детальную информацию асинхронно
+    let display_clone = display.clone();
+    let _dialog_clone = dialog.clone();
+    let notebook_clone = notebook.clone();
+    let vbox_clone = vbox.clone();
+    let loading_label_clone = loading_label.clone();
+    
+    glib::timeout_add_local_once(Duration::from_millis(100), move || {
+        let details = match get_monitor_details(&display_clone) {
+            Ok(details) => details,
+            Err(e) => {
+                loading_label_clone.set_text(&format!("Ошибка загрузки: {}", e));
+                return;
+            }
+        };
+        
+        // Удаляем индикатор загрузки
+        vbox_clone.remove(&loading_label_clone);
+        
+        // Создаем вкладки с информацией
+        create_monitor_info_tabs(&notebook_clone, &details);
+        
+        // Добавляем notebook
+        vbox_clone.prepend(&notebook_clone);
+    });
+    
+    dialog.present();
+}
+
+fn create_monitor_info_tabs(notebook: &Notebook, details: &MonitorDetails) {
+    // Вкладка "Основное"
+    let basic_page = create_basic_info_page(details);
+    notebook.append_page(&basic_page, Some(&Label::new(Some("Основное"))));
+    
+    // Вкладка "Настройки"
+    let settings_page = create_settings_page(details);
+    notebook.append_page(&settings_page, Some(&Label::new(Some("Настройки"))));
+    
+    // Вкладка "Capabilities" (если есть данные)
+    if details.capabilities_string.is_some() {
+        let caps_page = create_capabilities_page(details);
+        notebook.append_page(&caps_page, Some(&Label::new(Some("Capabilities"))));
+    }
+    
+    // Вкладка "Технические"
+    let tech_page = create_technical_page(details);
+    notebook.append_page(&tech_page, Some(&Label::new(Some("Технические"))));
+    
+    // Вкладка "EDID" (если есть данные)
+    if details.edid_hex.is_some() {
+        let edid_page = create_edid_page(details);
+        notebook.append_page(&edid_page, Some(&Label::new(Some("EDID"))));
+    }
+}
+
+fn create_basic_info_page(details: &MonitorDetails) -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    
+    // Основная информация
+    add_info_row(&vbox, "Производитель:", &details.manufacturer);
+    add_info_row(&vbox, "Модель:", &details.model);
+    
+    if let Some(ref serial) = details.serial_number {
+        add_info_row(&vbox, "Серийный номер:", serial);
+    }
+    
+    if let (Some(year), Some(week)) = (details.manufacture_year, details.manufacture_week) {
+        add_info_row(&vbox, "Дата производства:", &format!("{} год, {} неделя", year, week));
+    }
+    
+    if let Some(ref version) = details.edid_version {
+        add_info_row(&vbox, "Версия EDID:", version);
+    }
+    
+    if let Some(ref input) = details.video_input {
+        add_info_row(&vbox, "Тип входа:", input);
+    }
+    
+    if let Some(ref resolution) = details.resolution {
+        add_info_row(&vbox, "Разрешение:", resolution);
+    }
+    
+    if let Some(ref size) = details.physical_size {
+        add_info_row(&vbox, "Физический размер:", size);
+    }
+    
+    if let Some(ref ratio) = details.aspect_ratio {
+        add_info_row(&vbox, "Соотношение сторон:", ratio);
+    }
+    
+    if let Some(ref color_space) = details.color_space {
+        add_info_row(&vbox, "Тип монитора:", color_space);
+    }
+    
+    // Статистика
+    let separator = Separator::new(Orientation::Horizontal);
+    separator.set_margin_top(12);
+    separator.set_margin_bottom(12);
+    vbox.append(&separator);
+    
+    if let Some(ref last_update) = details.last_update {
+        add_info_row(&vbox, "Последнее обновление:", last_update);
+    }
+    
+    if details.read_errors > 0 {
+        add_info_row(&vbox, "Ошибки чтения:", &format!("{}", details.read_errors));
+    }
+    
+    scrolled.set_child(Some(&vbox));
+    scrolled
+}
+
+fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    
+    // DDC/CI информация
+    if let Some(ref mccs) = details.mccs_version {
+        add_info_row(&vbox, "Версия MCCS:", mccs);
+    }
+    
+    if let Some(ref controller) = details.controller_mfg {
+        add_info_row(&vbox, "Контроллер:", controller);
+    }
+    
+    if let Some(ref firmware) = details.firmware_version {
+        add_info_row(&vbox, "Версия прошивки:", firmware);
+    }
+    
+    // Текущие настройки
+    let separator1 = Separator::new(Orientation::Horizontal);
+    separator1.set_margin_top(12);
+    separator1.set_margin_bottom(12);
+    vbox.append(&separator1);
+    
+    let settings_label = Label::new(Some("Текущие настройки:"));
+    settings_label.set_xalign(0.0);
+    settings_label.set_markup("<b>Текущие настройки:</b>");
+    vbox.append(&settings_label);
+    
+    if let Some(brightness) = details.current_brightness {
+        add_info_row(&vbox, "Яркость:", &format!("{}/100", brightness));
+    }
+    
+    if let Some(contrast) = details.current_contrast {
+        add_info_row(&vbox, "Контраст:", &format!("{}/100", contrast));
+    }
+    
+    if let Some(ref input_source) = details.current_input_source {
+        add_info_row(&vbox, "Источник входа:", input_source);
+    }
+    
+    if let Some(volume) = details.current_volume {
+        add_info_row(&vbox, "Громкость:", &format!("{}/100", volume));
+    }
+    
+    if let Some(ref power_state) = details.current_power_state {
+        add_info_row(&vbox, "Состояние питания:", power_state);
+    }
+    
+    // Цветовые каналы
+    if details.red_gain.is_some() || details.green_gain.is_some() || details.blue_gain.is_some() {
+        let separator2 = Separator::new(Orientation::Horizontal);
+        separator2.set_margin_top(12);
+        separator2.set_margin_bottom(12);
+        vbox.append(&separator2);
+        
+        let color_label = Label::new(Some("Цветовые каналы:"));
+        color_label.set_xalign(0.0);
+        color_label.set_markup("<b>Цветовые каналы:</b>");
+        vbox.append(&color_label);
+        
+        if let Some(red) = details.red_gain {
+            add_info_row(&vbox, "Красный канал:", &format!("{}", red));
+        }
+        
+        if let Some(green) = details.green_gain {
+            add_info_row(&vbox, "Зеленый канал:", &format!("{}", green));
+        }
+        
+        if let Some(blue) = details.blue_gain {
+            add_info_row(&vbox, "Синий канал:", &format!("{}", blue));
+        }
+    }
+    
+    if let Some(backlight) = details.backlight_control {
+        add_info_row(&vbox, "Управление подсветкой:", &format!("{}", backlight));
+    }
+    
+    if let Some(ref osd_lang) = details.osd_language {
+        add_info_row(&vbox, "Язык OSD:", osd_lang);
+    }
+    
+    // Поддерживаемые VCP коды
+    if !details.supported_vcp_codes.is_empty() {
+        let separator = Separator::new(Orientation::Horizontal);
+        separator.set_margin_top(12);
+        separator.set_margin_bottom(12);
+        vbox.append(&separator);
+        
+        let vcp_label = Label::new(Some("Поддерживаемые VCP коды:"));
+        vcp_label.set_xalign(0.0);
+        vcp_label.set_markup("<b>Поддерживаемые VCP коды:</b>");
+        vbox.append(&vcp_label);
+        
+        let mut vcp_codes = details.supported_vcp_codes.clone();
+        vcp_codes.sort();
+        let vcp_text = vcp_codes.iter()
+            .map(|code| format!("0x{:02X}", code))
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        let vcp_value_label = Label::new(Some(&vcp_text));
+        vcp_value_label.set_xalign(0.0);
+        vcp_value_label.set_wrap(true);
+        vcp_value_label.set_selectable(true);
+        vbox.append(&vcp_value_label);
+    }
+    
+    scrolled.set_child(Some(&vbox));
+    scrolled
+}
+
+fn create_capabilities_page(details: &MonitorDetails) -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    
+    if let Some(ref caps_string) = details.capabilities_string {
+        // Заголовок
+        let title_label = Label::new(Some("DDC/CI Capabilities String:"));
+        title_label.set_xalign(0.0);
+        title_label.set_markup("<b>DDC/CI Capabilities String:</b>");
+        vbox.append(&title_label);
+        
+        // Текстовое поле с capabilities string
+        let text_view = TextView::new();
+        text_view.set_editable(false);
+        text_view.set_cursor_visible(false);
+        text_view.set_wrap_mode(WrapMode::Word);
+        text_view.set_monospace(true);
+        
+        let buffer = text_view.buffer();
+        buffer.set_text(caps_string);
+        
+        let scrolled_text = ScrolledWindow::new();
+        scrolled_text.set_policy(PolicyType::Automatic, PolicyType::Automatic);
+        scrolled_text.set_min_content_height(300);
+        scrolled_text.set_child(Some(&text_view));
+        vbox.append(&scrolled_text);
+        
+        // Парсинг capabilities
+        let separator = Separator::new(Orientation::Horizontal);
+        separator.set_margin_top(12);
+        separator.set_margin_bottom(12);
+        vbox.append(&separator);
+        
+        let parsed_label = Label::new(Some("Распознанная информация:"));
+        parsed_label.set_xalign(0.0);
+        parsed_label.set_markup("<b>Распознанная информация:</b>");
+        vbox.append(&parsed_label);
+        
+        // Извлекаем и показываем информацию из capabilities
+        if caps_string.contains("mccs_ver(") {
+            if let Some(start) = caps_string.find("mccs_ver(") {
+                if let Some(end) = caps_string[start..].find(')') {
+                    let version = &caps_string[start+9..start+end];
+                    add_info_row(&vbox, "MCCS версия:", version);
+                }
+            }
+        }
+        
+        if caps_string.contains("model(") {
+            if let Some(start) = caps_string.find("model(") {
+                if let Some(end) = caps_string[start..].find(')') {
+                    let model = &caps_string[start+6..start+end];
+                    add_info_row(&vbox, "Модель:", model);
+                }
+            }
+        }
+        
+        if caps_string.contains("type(") {
+            if let Some(start) = caps_string.find("type(") {
+                if let Some(end) = caps_string[start..].find(')') {
+                    let monitor_type = &caps_string[start+5..start+end];
+                    add_info_row(&vbox, "Тип монитора:", monitor_type);
+                }
+            }
+        }
+        
+        if caps_string.contains("cmds(") {
+            if let Some(start) = caps_string.find("cmds(") {
+                if let Some(end) = caps_string[start..].find(')') {
+                    let commands = &caps_string[start+5..start+end];
+                    add_info_row(&vbox, "Поддерживаемые команды:", commands);
+                }
+            }
+        }
+        
+        // Показываем VCP коды более детально
+        if !details.supported_vcp_codes.is_empty() {
+            let vcp_separator = Separator::new(Orientation::Horizontal);
+            vcp_separator.set_margin_top(12);
+            vcp_separator.set_margin_bottom(12);
+            vbox.append(&vcp_separator);
+            
+            let vcp_label = Label::new(Some("Поддерживаемые VCP коды:"));
+            vcp_label.set_xalign(0.0);
+            vcp_label.set_markup("<b>Поддерживаемые VCP коды:</b>");
+            vbox.append(&vcp_label);
+            
+            let mut vcp_codes = details.supported_vcp_codes.clone();
+            vcp_codes.sort();
+            
+            let codes_text = vcp_codes.iter()
+                .map(|code| {
+                    let description = match *code {
+                        0x10 => "Яркость",
+                        0x12 => "Контраст",
+                        0x13 => "Управление подсветкой",
+                        0x14 => "Цветовая температура",
+                        0x16 => "Красный канал",
+                        0x18 => "Зеленый канал",
+                        0x1A => "Синий канал",
+                        0x60 => "Источник входа",
+                        0x62 => "Громкость",
+                        0xD6 => "Состояние питания",
+                        _ => "Неизвестно",
+                    };
+                    format!("0x{:02X} - {}", code, description)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            let vcp_text_view = TextView::new();
+            vcp_text_view.set_editable(false);
+            vcp_text_view.set_cursor_visible(false);
+            vcp_text_view.set_monospace(true);
+            
+            let buffer = vcp_text_view.buffer();
+            buffer.set_text(&codes_text);
+            
+            let vcp_scrolled = ScrolledWindow::new();
+            vcp_scrolled.set_policy(PolicyType::Automatic, PolicyType::Automatic);
+            vcp_scrolled.set_min_content_height(200);
+            vcp_scrolled.set_child(Some(&vcp_text_view));
+            vbox.append(&vcp_scrolled);
+        }
+    } else {
+        let no_data_label = Label::new(Some("Capabilities данные недоступны"));
+        no_data_label.set_xalign(0.5);
+        no_data_label.set_yalign(0.5);
+        vbox.append(&no_data_label);
+    }
+    
+    scrolled.set_child(Some(&vbox));
+    scrolled
+}
+
+fn create_technical_page(details: &MonitorDetails) -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    
+    // Системная информация
+    let system_label = Label::new(Some("Системная информация:"));
+    system_label.set_xalign(0.0);
+    system_label.set_markup("<b>Системная информация:</b>");
+    vbox.append(&system_label);
+    
+    add_info_row(&vbox, "I2C шина:", &details.i2c_bus);
+    
+    if let Some(ref device_path) = details.device_path {
+        add_info_row(&vbox, "Путь к устройству:", device_path);
+    }
+    
+    if let Some(ref connector) = details.drm_connector {
+        add_info_row(&vbox, "DRM коннектор:", connector);
+    }
+    
+    if let Some(ref driver) = details.driver {
+        add_info_row(&vbox, "Драйвер:", driver);
+    }
+    
+    if let Some(ref pci_path) = details.pci_path {
+        add_info_row(&vbox, "PCI путь:", pci_path);
+    }
+    
+    // DDC/CI статистика
+    let separator = Separator::new(Orientation::Horizontal);
+    separator.set_margin_top(12);
+    separator.set_margin_bottom(12);
+    vbox.append(&separator);
+    
+    let ddc_label = Label::new(Some("DDC/CI статистика:"));
+    ddc_label.set_xalign(0.0);
+    ddc_label.set_markup("<b>DDC/CI статистика:</b>");
+    vbox.append(&ddc_label);
+    
+    add_info_row(&vbox, "Ошибки чтения:", &format!("{}", details.read_errors));
+    
+    if let Some(ref last_update) = details.last_update {
+        add_info_row(&vbox, "Последнее обновление:", last_update);
+    }
+    
+    add_info_row(&vbox, "Поддерживаемых VCP кодов:", &format!("{}", details.supported_vcp_codes.len()));
+    
+    // Дополнительная информация
+    if details.capabilities_string.is_some() {
+        add_info_row(&vbox, "Capabilities доступны:", "Да");
+    } else {
+        add_info_row(&vbox, "Capabilities доступны:", "Нет");
+    }
+    
+    if details.edid_hex.is_some() {
+        add_info_row(&vbox, "EDID доступен:", "Да");
+    } else {
+        add_info_row(&vbox, "EDID доступен:", "Нет");
+    }
+    
+    scrolled.set_child(Some(&vbox));
+    scrolled
+}
+
+fn create_edid_page(details: &MonitorDetails) -> ScrolledWindow {
+    let scrolled = ScrolledWindow::new();
+    scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    
+    let label = Label::new(Some("EDID Hex Dump:"));
+    label.set_xalign(0.0);
+    label.set_markup("<b>EDID Hex Dump:</b>");
+    vbox.append(&label);
+    
+    if let Some(ref edid_hex) = details.edid_hex {
+        let text_view = TextView::new();
+        let buffer = TextBuffer::new(None);
+        buffer.set_text(edid_hex);
+        text_view.set_buffer(Some(&buffer));
+        text_view.set_editable(false);
+        text_view.set_monospace(true);
+        text_view.set_margin_top(8);
+        
+        let scrolled_text = ScrolledWindow::new();
+        scrolled_text.set_height_request(400);
+        scrolled_text.set_child(Some(&text_view));
+        vbox.append(&scrolled_text);
+        
+        // Кнопка копирования
+        let copy_button = Button::with_label("Копировать в буфер обмена");
+        copy_button.set_margin_top(8);
+        
+        let edid_hex_for_copy = edid_hex.clone();
+        copy_button.connect_clicked(move |_| {
+            if let Some(display) = gtk::gdk::Display::default() {
+                let clipboard = display.clipboard();
+                clipboard.set_text(&edid_hex_for_copy);
+            }
+        });
+        
+        vbox.append(&copy_button);
+    }
+    
+    scrolled.set_child(Some(&vbox));
+    scrolled
+}
+
+fn add_info_row(container: &GtkBox, label: &str, value: &str) {
+    let hbox = GtkBox::new(Orientation::Horizontal, 12);
+    
+    let label_widget = Label::new(Some(label));
+    label_widget.set_xalign(0.0);
+    label_widget.set_width_chars(20);
+    label_widget.set_markup(&format!("<b>{}</b>", label));
+    
+    let value_widget = Label::new(Some(value));
+    value_widget.set_xalign(0.0);
+    value_widget.set_selectable(true);
+    value_widget.set_wrap(true);
+    value_widget.set_hexpand(true);
+    
+    hbox.append(&label_widget);
+    hbox.append(&value_widget);
+    container.append(&hbox);
 }
 
 fn load_brightness_profile() -> Result<HashMap<u8, u8>, String> {
@@ -1620,6 +3046,23 @@ fn build_ui(app: &Application) {
                                 frame.add_css_class("card");
                                 frame.set_hexpand(true);
                                 frame.set_child(Some(&grid));
+                                
+                                // Добавляем обработчик клика для показа подробной информации
+                                let click_gesture = GestureClick::new();
+                                let display_for_click = d.clone();
+                                let win_for_dialog = win_weak_for_measure_outer.clone();
+                                
+                                click_gesture.connect_pressed(move |_, _, _, _| {
+                                    if let Some(win) = win_for_dialog.upgrade() {
+                                        show_monitor_details_dialog(&win, &display_for_click);
+                                    }
+                                });
+                                
+                                frame.add_controller(click_gesture);
+                                
+                                // Добавляем CSS класс для hover эффекта
+                                frame.add_css_class("clickable-card");
+                                
                                 list_box_target.append(&frame);
                             }
                             
