@@ -148,6 +148,25 @@ EOF
 echo -e "${G}Installed binaries to:${Z} $INSTALL_BIN"
 echo -e "${G}Created autostart entry:${Z} $DESKTOP_FILE"
 
+# 5b) Create Applications menu launcher for manual start
+APP_DIR="$HOME/.local/share/applications"
+mkdir -p "$APP_DIR"
+APP_DESKTOP_FILE="$APP_DIR/mondis-tray.desktop"
+cat > "$APP_DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Mondis Tray
+Comment=Mondis system tray icon
+Exec=$INSTALL_BIN/mondis-tray
+TryExec=$INSTALL_BIN/mondis-tray
+Icon=$ICON_NAME
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+EOF
+echo -e "${G}Created application launcher:${Z} $APP_DESKTOP_FILE"
+
 # 6) Suggest adding ~/.local/bin to PATH if missing
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) : ;;
@@ -156,6 +175,22 @@ case ":$PATH:" in
     echo "  export PATH=\"$HOME/.local/bin:\$PATH\""
     ;;
 esac
+
+# 6b) Provide helper script to manually start tray if needed
+START_HELPER="$INSTALL_BIN/mondis-tray-start"
+cat > "$START_HELPER" <<'EOSH'
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v pgrep >/dev/null 2>&1 && pgrep -u "$USER" -x mondis-tray >/dev/null 2>&1; then
+  echo "mondis-tray is already running"
+  exit 0
+fi
+nohup "$HOME/.local/bin/mondis-tray" >/dev/null 2>&1 &
+disown || true
+echo "mondis-tray started"
+EOSH
+chmod +x "$START_HELPER"
+echo -e "${G}Helper to start tray manually:${Z} $START_HELPER"
 
 # 7) Start tray now if not already running
 if command -v pgrep >/dev/null 2>&1; then
@@ -169,3 +204,4 @@ if command -v pgrep >/dev/null 2>&1; then
 fi
 
 echo -e "${G}==> Mondis installation complete.${Z}"
+echo -e "${Y}Tip:${Z} You can start the tray manually via: $START_HELPER or from your application menu (Mondis Tray)."

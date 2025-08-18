@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports, unused_variables, unused_mut)]
+
 use anyhow::Result;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box as GtkBox, Label, Orientation, Scale, Separator, Button, HeaderBar, CssProvider, Image, Window, Notebook, ScrolledWindow, TextView, TextBuffer, GestureClick, WrapMode, PolicyType};
