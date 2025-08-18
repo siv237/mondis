@@ -24,121 +24,65 @@
 - `mondis-x11`: Модуль для интеграции с X11/XRandR.
 - `mondis-panel-direct`: Основное приложение с графическим интерфейсом.
 
-## Установка
+## Установка (просто)
 
-### 1. Установка Rust
+Рекомендуемый путь — встроенный инсталлер. Он:
+- установит системные зависимости (через sudo для популярных дистрибутивов),
+- поставит/обновит Rust, соберёт проект в release,
+- установит бинарники в `~/.local/bin`,
+- создаст автозапуск и ярлык в меню приложений,
+- добавит helper-скрипт для ручного запуска трея.
 
-Для сборки проекта вам понадобится `rustc` и `cargo`. Рекомендуемый способ установки — через `rustup`.
-
+1) Клонируйте репозиторий:
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/siv237/mondis.git
+cd mondis
 ```
 
-Эта команда скачает и запустит `rustup-init`, который установит последнюю стабильную версию Rust.
-
-### 2. Системные зависимости
-
-После установки Rust необходимо установить системные зависимости. Названия пакетов могут отличаться в разных дистрибутивах Linux.
-
-**Для Debian / Ubuntu:**
+2) Запустите инсталлер:
 ```bash
-# Основные инструменты для сборки
-sudo apt install -y build-essential pkg-config curl git
-
-# Зависимости для GUI (GTK4)
-sudo apt install -y libgtk-4-dev
-
-# Утилиты для взаимодействия с мониторами
-# Программная яркость опирается на xrandr (нужен бинарник),
-# аппаратная — на доступ к /dev/i2c-*
-sudo apt install -y x11-xserver-utils i2c-tools
-
-# (Опционально) ddcutil как внешняя утилита для диагностики
-sudo apt install -y ddcutil
+bash scripts/install.sh
 ```
 
-Примечания по зависимостям:
-- Проект использует GTK4. Пакеты GTK3 (например, libgtk-3-dev) не требуются.
-- Библиотека `libxrandr-dev` не нужна: используется именно утилита `xrandr` (бинарь),
-  а не заголовки XRandR. Убедитесь, что `xrandr` доступен в PATH.
-- Для аппаратного управления по DDC/CI требуется доступ к I2C-устройствам
-  (`/dev/i2c-*`). На Debian/Ubuntu добавьте пользователя в группу `i2c`:
-  ```bash
-  sudo usermod -aG i2c $USER
-  # затем выйдите и зайдите в сессию, либо выполните re-login
-  ```
-  При необходимости можно добавить udev-правило (пример):
-  ```bash
-  echo 'KERNEL=="i2c-[0-9]*", MODE="0660", GROUP="i2c"' | sudo tee /etc/udev/rules.d/60-i2c.rules
-  sudo udevadm control --reload-rules && sudo udevadm trigger
-  ```
-
-**Для Arch Linux / Manjaro:**
+По завершении:
+- трей стартует автоматически (если не был запущен),
+- в меню приложений появится «Mondis Tray»,
+- вручную запустить трей можно так:
 ```bash
-sudo pacman -S --needed base-devel pkgconf gtk4 xorg-xrandr i2c-tools git
+~/.local/bin/mondis-tray-start
 ```
 
-**Для Fedora:**
+Подсказки:
+- Если случайно закрыли трей («Выход») — используйте `mondis-tray-start` или ярлык в меню.
+- Панель можно открыть из меню трея («Open Mondis») или запустить напрямую: `~/.local/bin/mondis-panel-direct`.
+
+Удаление:
 ```bash
-sudo dnf install -y @"Development Tools" @"Development Libraries" \
-    gtk4-devel pkgconf-pkg-config xrandr i2c-tools git
+bash scripts/uninstall.sh
 ```
 
-**Для CentOS 8/9 Stream (RHEL 8/9):**
+Если `~/.local/bin` не в PATH, добавьте:
 ```bash
-# Включить EPEL (для i2c-tools и сопутствующих пакетов)
-sudo dnf install -y epel-release
-
-# Включить дополнительный репозиторий с библиотеками
-# CentOS Stream 8:
-sudo dnf config-manager --set-enabled powertools
-# CentOS Stream 9 / RHEL 9:
-sudo dnf config-manager --set-enabled crb
-
-# Наборы инструментов для сборки
-sudo dnf groupinstall -y "Development Tools" "Development Libraries"
-
-# Зависимости
-sudo dnf install -y gtk4-devel pkgconf-pkg-config xrandr i2c-tools git
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.profile
 ```
 
-## Сборка и запуск
+## Сборка из исходников (альтернативно)
 
-1.  **Клонируйте репозиторий:**
-    ```bash
-    git clone https://github.com/siv237/mondis.git
-    cd mondis
-    ```
+Если нужен ручной путь без инсталлера:
+```bash
+# Установите Rust (если нет)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+export PATH="$HOME/.cargo/bin:$PATH"
 
-2.  **Сборка проекта:**
+# Сборка
+cargo build --release -p mondis-tray -p mondis-panel-direct
 
-    *   Для отладочной версии:
-        ```bash
-        cargo build
-        ```
-    *   Для оптимизированной релизной версии:
-        ```bash
-        cargo build --release
-        ```
+# Установка бинарников
+install -m 0755 target/release/mondis-tray ~/.local/bin/
+install -m 0755 target/release/mondis-panel-direct ~/.local/bin/ || true
+```
 
-3.  **Запуск приложения:**
-
-    Основной исполняемый файл находится в пакете `mondis-panel-direct`.
-    Для отладки:
-    ```bash
-    cargo run -p mondis-panel-direct
-    ```
-    Для релизного запуска:
-    ```bash
-    cargo run -p mondis-panel-direct --release
-    ```
-
-4.  **Быстрая проверка кода:**
-
-    Для проверки кода на ошибки без полной компиляции:
-    ```bash
-    cargo check
-    ```
+Ярлык/автозапуск и helper в этом случае не создаются автоматически — используйте инсталлер или настройте вручную.
 
 ## Лицензия
 
