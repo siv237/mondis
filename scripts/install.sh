@@ -20,6 +20,37 @@ need_cmd() {
   fi
 }
 
+# Configure access to I2C devices for DDC/CI without sudo
+configure_i2c_access() {
+  echo -e "${Y}==> Configuring I2C access (DDC/CI)...${Z}"
+  # Create udev rule to ensure group i2c and mode 0660 for /dev/i2c-*
+  if has_cmd sudo; then
+    echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/45-ddc-i2c.rules >/dev/null || true
+    sudo udevadm control --reload || true
+    sudo udevadm trigger || true
+  else
+    echo -e "${R}sudo not found; skipping udev rule creation. Create /etc/udev/rules.d/45-ddc-i2c.rules manually.${Z}"
+  fi
+
+  # Add the invoking user to i2c group
+  TARGET_USER="${SUDO_USER:-$USER}"
+  if id -nG "$TARGET_USER" | grep -qw i2c; then
+    echo -e "${G}User already in i2c group:${Z} $TARGET_USER"
+  else
+    if has_cmd sudo; then
+      sudo usermod -aG i2c "$TARGET_USER" || true
+      echo -e "${Y}Added user to i2c group:${Z} $TARGET_USER (log out/in to take effect in new sessions)"
+    else
+      echo -e "${R}sudo not found; cannot add $TARGET_USER to i2c group automatically.${Z}"
+    fi
+  fi
+
+  # Apply group/permissions to existing I2C device nodes for immediate use
+  if has_cmd sudo; then
+    sudo bash -lc 'shopt -s nullglob; for d in /dev/i2c-*; do chgrp i2c "$d" 2>/dev/null || true; chmod g+rw "$d" 2>/dev/null || true; done'
+  fi
+}
+
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 install_system_deps() {
@@ -100,6 +131,9 @@ install_system_deps() {
 
 # 1) System dependencies (build tools, GTK4 dev, ddcutil)
 install_system_deps || echo -e "${Y}Dependency installation skipped/failed; continuing if already satisfied...${Z}"
+
+# 1b) Configure I2C access for DDC/CI
+configure_i2c_access || true
 
 # 2) Ensure Rust toolchain
 if ! command -v cargo >/dev/null 2>&1; then
