@@ -1,0 +1,17 @@
+[package]
+name = "mondis-tray"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+ksni = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+which = "6"
+
+# Optional GTK3 for XFCE tray without menu
+gtk = { version = "0.18", package = "gtk", optional = true }
+
+[features]
+# Enable GTK-based StatusIcon tray (recommended for XFCE to avoid forced menus)
+xfce-gtk-tray = ["gtk"]
