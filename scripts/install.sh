@@ -38,9 +38,11 @@ install_system_deps() {
         sudo apt-get update
         sudo apt-get install -y \
           build-essential pkg-config curl git \
-          libgtk-4-dev libglib2.0-dev libpango1.0-dev \
-          libgdk-pixbuf-2.0-dev libcairo2-dev \
-          libx11-dev libxrandr-dev ddcutil
+          libgtk-4-dev libdbus-1-dev libxrandr-dev
+        # Optional runtime tool for hardware brightness via DDC/CI
+        if ! dpkg -s ddcutil >/dev/null 2>&1; then
+          echo -e "${Y}Note:${Z} You may want to 'sudo apt-get install -y ddcutil' for hardware brightness (optional)."
+        fi
         ;;
       fedora|rhel|rocky|almalinux|centos)
         echo -e "${Y}Detected Fedora/RHEL family${Z}"
@@ -48,14 +50,14 @@ install_system_deps() {
         sudo dnf -y install \
           gcc gcc-c++ make pkgconf-pkg-config curl git \
           gtk4-devel glib2-devel pango-devel gdk-pixbuf2-devel cairo-devel \
-          libX11-devel libXrandr-devel ddcutil
+          libX11-devel libXrandr-devel dbus-devel ddcutil
         ;;
       arch|manjaro|endeavouros|arco|garuda)
         echo -e "${Y}Detected Arch family${Z}"
         sudo pacman -Syu --noconfirm
         sudo pacman -S --noconfirm --needed \
           base-devel pkgconf curl git \
-          gtk4 glib2 pango gdk-pixbuf2 cairo libx11 libxrandr ddcutil
+          gtk4 glib2 pango gdk-pixbuf2 cairo libx11 libxrandr dbus ddcutil
         ;;
       opensuse*|suse|sle)
         echo -e "${Y}Detected openSUSE/SLE family${Z}"
@@ -64,7 +66,7 @@ install_system_deps() {
         sudo zypper -n install \
           gcc gcc-c++ make pkg-config curl git \
           gtk4-devel glib2-devel pango-devel gdk-pixbuf-devel cairo-devel \
-          libX11-devel libXrandr-devel ddcutil
+          libX11-devel libXrandr-devel dbus-1-devel ddcutil
         ;;
       *)
         # Try by ID_LIKE
@@ -73,16 +75,17 @@ install_system_deps() {
           sudo apt-get update
           sudo apt-get install -y \
             build-essential pkg-config curl git \
-            libgtk-4-dev libglib2.0-dev libpango1.0-dev \
-            libgdk-pixbuf-2.0-dev libcairo2-dev \
-            libx11-dev libxrandr-dev ddcutil
+            libgtk-4-dev libdbus-1-dev libxrandr-dev
+          if ! command -v ddcutil >/dev/null 2>&1; then
+            echo -e "${Y}Note:${Z} Consider installing ddcutil for DDC/CI support (optional)."
+          fi
         elif echo "$ID_LIKE_LOWER" | grep -q rhel; then
           echo -e "${Y}Detected RHEL-like via ID_LIKE${Z}"
           sudo dnf -y groupinstall "Development Tools" || true
           sudo dnf -y install \
             gcc gcc-c++ make pkgconf-pkg-config curl git \
             gtk4-devel glib2-devel pango-devel gdk-pixbuf2-devel cairo-devel \
-            libX11-devel libXrandr-devel ddcutil
+            libX11-devel libXrandr-devel dbus-devel ddcutil
         else
           echo -e "${R}Unsupported distro. Please install GTK4 dev stack and build tools manually.${Z}"
           return 1
