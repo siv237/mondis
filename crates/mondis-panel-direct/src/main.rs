@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::thread;
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
 use std::process::Command;
@@ -18,6 +19,75 @@ use i2cdev::linux::LinuxI2CDevice;
 use i2cdev::core::I2CDevice;
 use std::fs;
 use std::path::PathBuf;
+
+// ---------- Config, cache and settings ----------
+
+fn get_config_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
+    let dir = PathBuf::from(home).join(".config").join("mondis");
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
+    Ok(dir)
+}
+
+fn get_displays_cache_path() -> Result<PathBuf, String> {
+    Ok(get_config_dir()?.join("displays_cache.json"))
+}
+
+
+fn read_displays_cache() -> Result<Option<Vec<VideoCard>>, String> {
+    let path = get_displays_cache_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(&path).map_err(|e| format!("Failed to read cache {:?}: {}", path, e))?;
+    let cards: Vec<VideoCard> = serde_json::from_str(&data).map_err(|e| format!("Failed to parse cache JSON: {}", e))?;
+    Ok(Some(cards))
+}
+
+fn write_displays_cache(cards: &[VideoCard]) -> Result<(), String> {
+    let path = get_displays_cache_path()?;
+    let data = serde_json::to_string_pretty(cards).map_err(|e| format!("Failed to serialize cache JSON: {}", e))?;
+    fs::write(&path, data).map_err(|e| format!("Failed to write cache {:?}: {}", path, e))?;
+    Ok(())
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct UiSettings {
+    control_prefs: HashMap<u8, String>,
+    last_values_ddc: HashMap<u8, u8>,
+    last_values_xrandr: HashMap<u8, u8>,
+}
+
+fn get_settings_path() -> Result<PathBuf, String> { Ok(get_config_dir()?.join("settings.json")) }
+
+fn read_settings() -> UiSettings {
+    if let Ok(path) = get_settings_path() {
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(cfg) = serde_json::from_str::<UiSettings>(&content) { return cfg; }
+        }
+    }
+    UiSettings::default()
+}
+
+fn write_settings(settings: &UiSettings) {
+    if let Ok(path) = get_settings_path() {
+        if let Ok(serialized) = serde_json::to_string_pretty(settings) {
+            let _ = fs::write(path, serialized);
+        }
+    }
+}
+
+fn save_settings_from_state(control_prefs: &RefCell<HashMap<u8, ControlMethodPref>>, slider_refs: &RefCell<SliderRefs>) {
+    let prefs_map = control_prefs.borrow();
+    let refs = slider_refs.borrow();
+    let mut settings = UiSettings::default();
+    for (bus, pref) in prefs_map.iter() {
+        settings.control_prefs.insert(*bus, match pref { ControlMethodPref::Ddc => "ddc".into(), ControlMethodPref::Xrandr => "xrandr".into() });
+    }
+    settings.last_values_ddc = refs.last_values_ddc.clone();
+    settings.last_values_xrandr = refs.last_values_xrandr.clone();
+    thread::spawn(move || { write_settings(&settings); });
+}
 
 fn setup_styles() {
     // Современные стили: карточки, отступы, скругления
@@ -178,7 +248,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct DisplayInfo { 
     i2c_bus: u8,
     name: String,
@@ -192,7 +262,7 @@ struct DisplayInfo {
     port_name: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct VideoCard {
     name: String,
     displays: Vec<DisplayInfo>,
@@ -2844,6 +2914,10 @@ fn build_ui(app: &Application) {
         }
     };
 
+    // Делимся обработчиками через Rc для безопасного клонирования
+    let confirm_handler_shared: Rc<dyn Fn(Vec<DisplayInfo>)> = Rc::new(confirm_handler);
+    let cancel_handler_shared: Rc<dyn Fn(Vec<DisplayInfo>)> = Rc::new(cancel_handler);
+
     let list_box_for_populate = list_box.clone();
     // Используем слабую ссылку на окно и ссылку на корневой контейнер для измерения
     let win_weak_for_measure = win.downgrade();
@@ -2860,9 +2934,11 @@ fn build_ui(app: &Application) {
     let start_confirmation_timer_for_populate = start_confirmation_timer.clone();
     let confirm_handler_rc_for_populate = confirm_handler_rc.clone();
     let cancel_handler_rc_for_populate = cancel_handler_rc.clone();
-    let confirm_handler_for_populate = confirm_handler.clone();
-    let cancel_handler_for_populate = cancel_handler.clone();
+    let confirm_handler_for_populate = confirm_handler_shared.clone();
+    let cancel_handler_for_populate = cancel_handler_shared.clone();
     
+    let force_detect_next = Rc::new(Cell::new(false));
+    let force_detect_for_populate = force_detect_next.clone();
     let populate: Rc<dyn Fn()> = Rc::new(move || {
         // Clear list and reset state
         while let Some(child) = list_box_for_populate.first_child() {
@@ -2880,13 +2956,6 @@ fn build_ui(app: &Application) {
         header.set_xalign(0.0);
         list_box_for_populate.append(&header);
         
-        let (tx, rx) = async_channel::unbounded::<Result<Vec<VideoCard>, String>>();
-        thread::spawn(move || {
-            let displays_result = detect_i2c_displays();
-            let cards_result = displays_result.map(|displays| group_displays_by_card(displays));
-            let _ = tx.send_blocking(cards_result);
-        });
-        
         let list_box_target = list_box_for_populate.clone();
         // Клонируем ссылки для измерения, чтобы не тащить исходные и избежать move-проблем
         let win_weak_for_measure_outer = win_weak_for_measure.clone();
@@ -2897,15 +2966,37 @@ fn build_ui(app: &Application) {
         let slider_refs_for_async = slider_refs_for_populate.clone();
         let control_pref_map_for_async = control_pref_map_for_populate.clone();
         let start_timer_for_async = start_confirmation_timer_for_populate.clone();
-        let confirm_handler_rc_for_async = confirm_handler_rc_for_populate.clone();
-        let cancel_handler_rc_for_async = cancel_handler_rc_for_populate.clone();
-        let confirm_handler_for_async = confirm_handler_for_populate.clone();
-        let cancel_handler_for_async = cancel_handler_for_populate.clone();
-        
+
+        // Готовим канал результатов и решаем: грузить из кэша или запускать детект
+        let (tx, rx) = async_channel::unbounded::<Result<Vec<VideoCard>, String>>();
+        let mut rendered_from_cache = false;
+        if !force_detect_for_populate.get() {
+            if let Ok(Some(cards)) = read_displays_cache() {
+                // Отрисовываем из кэша немедленно через канал, чтобы переиспользовать общий рендер-пайплайн
+                if tx.send_blocking(Ok(cards)).is_ok() {
+                    rendered_from_cache = true;
+                }
+            }
+        }
+        if !rendered_from_cache {
+            // Запускаем детект в отдельном потоке и шлём результат
+            thread::spawn(move || {
+                let res = detect_i2c_displays().map(group_displays_by_card);
+                let _ = tx.send_blocking(res);
+            });
+        }
+
+        // Клонируем Rc чтобы не перемещать исходные переменные в async
+        let confirm_handler_rc_async = confirm_handler_rc_for_populate.clone();
+        let cancel_handler_rc_async = cancel_handler_rc_for_populate.clone();
+        let confirm_handler_async = confirm_handler_for_populate.clone();
+        let cancel_handler_async = cancel_handler_for_populate.clone();
         glib::spawn_future_local(async move {
             if let Ok(msg) = rx.recv().await {
                 match msg {
                     Ok(cards) if !cards.is_empty() => {
+                        // Пишем кэш (best-effort)
+                        let _ = write_displays_cache(&cards);
                         // Собираем все дисплеи для использования в callbacks
                         let all_displays: Vec<DisplayInfo> = cards.iter()
                             .flat_map(|card| card.displays.iter())
@@ -2917,354 +3008,348 @@ fn build_ui(app: &Application) {
                             card_header.set_xalign(0.0);
                             card_header.set_markup(&format!("<b>{}</b>", card.name));
                             list_box_target.append(&card_header);
-                            
-                            // Add displays for this card
+
+                            // Add displays for this card (deferred per row via idle)
                             for (display_index, d) in card.displays.into_iter().enumerate() {
-                                // Grid-ряд для ровных колонок: Порт | Тип | Название | Иконка | Бейдж | Слайдер | Значение
-                                let grid = gtk::Grid::new();
-                                grid.set_margin_start(20);
-                                grid.set_column_spacing(12);
-                                grid.set_row_spacing(6);
-                                grid.add_css_class("row");
-                                grid.set_hexpand(true);
-                                
-                                // Create port and monitor info
-                                let default_port = "Unknown Port".to_string();
-                                let port_info = d.port_name.as_ref().unwrap_or(&default_port);
-                                let monitor_name = match (&d.manufacturer, &d.model) {
-                                    (Some(mfg), Some(model)) => {
-                                        let expanded_mfg = match mfg.as_str() {
-                                            "ACR" => "Acer",
-                                            "GSM" => "LG", 
-                                            "SAM" => "Samsung",
-                                            "DEL" => "Dell",
-                                            "AUS" => "ASUS",
-                                            "BNQ" => "BenQ",
-                                            "AOC" => "AOC",
-                                            "HPN" => "HP",
-                                            "LEN" => "Lenovo",
-                                            "MSI" => "MSI",
-                                            _ => mfg,
-                                        };
-                                        format!("{} {}", expanded_mfg, model)
+                                let list_box_target = list_box_target.clone();
+                                let control_pref_map_for_async = control_pref_map_for_async.clone();
+                                let slider_refs_for_async = slider_refs_for_async.clone();
+                                let brightness_state_for_async = brightness_state_for_async.clone();
+                                let start_timer_for_async = start_timer_for_async.clone();
+                                let all_displays = all_displays.clone();
+                                let win_weak_for_measure_outer = win_weak_for_measure_outer.clone();
+                                glib::idle_add_local_once(move || {
+                                    // Grid-ряд для ровных колонок: Порт | Тип | Название | Иконка | Бейдж | Слайдер | Значение
+                                    let grid = gtk::Grid::new();
+                                    grid.set_margin_start(20);
+                                    grid.set_column_spacing(12);
+                                    grid.set_row_spacing(6);
+                                    grid.add_css_class("row");
+                                    grid.set_hexpand(true);
+
+                                    // Create port and monitor info
+                                    let default_port = "Unknown Port".to_string();
+                                    let port_info = d.port_name.as_ref().unwrap_or(&default_port);
+                                    let monitor_name = match (&d.manufacturer, &d.model) {
+                                        (Some(mfg), Some(model)) => {
+                                            let expanded_mfg = match mfg.as_str() {
+                                                "ACR" => "Acer",
+                                                "GSM" => "LG",
+                                                "SAM" => "Samsung",
+                                                "DEL" => "Dell",
+                                                "AUS" => "ASUS",
+                                                "BNQ" => "BenQ",
+                                                "AOC" => "AOC",
+                                                "HPN" => "HP",
+                                                "LEN" => "Lenovo",
+                                                "MSI" => "MSI",
+                                                _ => mfg,
+                                            };
+                                            format!("{} {}", expanded_mfg, model)
+                                        }
+                                        _ => "Unknown Monitor".to_string(),
+                                    };
+
+                                    let (control_method, badge_class, tooltip) = if d.supports_ddc {
+                                        (
+                                            "аппаратно",
+                                            "badge-ddc",
+                                            format!(
+                                                "Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}{}",
+                                                d.i2c_bus,
+                                                d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
+                                            ),
+                                        )
+                                    } else if let Some(ref out) = d.xrandr_output {
+                                        (
+                                            "программно",
+                                            "badge-xrandr",
+                                            format!(
+                                                "Управление: программно (xrandr)\nВывод: {}{}",
+                                                out,
+                                                d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
+                                            ),
+                                        )
+                                    } else {
+                                        (
+                                            "нет управления",
+                                            "badge-none",
+                                            d.connector.as_ref().map(|c| format!("Коннектор: {}", c)).unwrap_or_else(|| "Нет доступного метода".to_string())
+                                        )
+                                    };
+                                    // Инициализируем предпочтение метода
+                                    {
+                                        let mut pref_map = control_pref_map_for_async.borrow_mut();
+                                        let default_pref = if d.supports_ddc { ControlMethodPref::Ddc } else { ControlMethodPref::Xrandr };
+                                        pref_map.entry(d.i2c_bus).or_insert(default_pref);
                                     }
-                                    _ => "Unknown Monitor".to_string(),
-                                };
-                                
-                                let (control_method, badge_class, tooltip) = if d.supports_ddc {
-                                    (
-                                        "аппаратно",
-                                        "badge-ddc",
-                                        format!(
-                                            "Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}{}",
-                                            d.i2c_bus,
-                                            d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
-                                        ),
-                                    )
-                                } else if let Some(ref out) = d.xrandr_output {
-                                    (
-                                        "программно",
-                                        "badge-xrandr",
-                                        format!(
-                                            "Управление: программно (xrandr)\nВывод: {}{}",
-                                            out,
-                                            d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
-                                        ),
-                                    )
-                                } else {
-                                    (
-                                        "нет управления",
-                                        "badge-none",
-                                        d.connector.as_ref().map(|c| format!("Коннектор: {}", c)).unwrap_or_else(|| "Нет доступного метода".to_string())
-                                    )
-                                };
-                                // Инициализируем предпочтение метода
-                                {
-                                    let mut pref_map = control_pref_map_for_async.borrow_mut();
-                                    let default_pref = if d.supports_ddc { ControlMethodPref::Ddc } else { ControlMethodPref::Xrandr };
-                                    pref_map.entry(d.i2c_bus).or_insert(default_pref);
-                                }
-                                
-                                // Determine port type from connector info
-                                let port_type = if let Some(ref connector) = d.connector {
-                                    if connector.contains("HDMI") {
-                                        "HDMI"
-                                    } else if connector.contains("DP") {
-                                        "DisplayPort"
-                                    } else if connector.contains("DVI") {
-                                        "DVI"
-                                    } else if connector.contains("VGA") {
-                                        "VGA"
+
+                                    // Determine port type from connector info
+                                    let port_type = if let Some(ref connector) = d.connector {
+                                        if connector.contains("HDMI") {
+                                            "HDMI"
+                                        } else if connector.contains("DP") {
+                                            "DisplayPort"
+                                        } else if connector.contains("DVI") {
+                                            "DVI"
+                                        } else if connector.contains("VGA") {
+                                            "VGA"
+                                        } else {
+                                            "Unknown"
+                                        }
                                     } else {
                                         "Unknown"
-                                    }
-                                } else {
-                                    "Unknown"
-                                };
-                                
-                                // Колонки: порт, тип, название, иконка, бейдж
-                                let port_lbl = Label::new(Some(port_info));
-                                port_lbl.add_css_class("port");
-                                port_lbl.set_xalign(0.0);
-                                port_lbl.set_width_chars(14);
-                                let type_lbl = Label::new(Some(port_type));
-                                type_lbl.add_css_class("type");
-                                type_lbl.set_xalign(0.0);
-                                type_lbl.set_width_chars(12);
-                                let monitor_lbl = Label::new(Some(&monitor_name));
-                                monitor_lbl.add_css_class("monitor");
-                                monitor_lbl.set_xalign(0.0);
-                                monitor_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                                monitor_lbl.set_hexpand(true);
-                                let badge_icon = match badge_class {
-                                    "badge-none" => Image::from_icon_name("dialog-warning-symbolic"),
-                                    _ => Image::from_icon_name("video-display-symbolic"),
-                                };
-                                // Выравнивание и стили для иконки-кнопки
-                                badge_icon.set_halign(gtk::Align::Center);
-                                badge_icon.set_valign(gtk::Align::Center);
-                                badge_icon.set_margin_start(6);
-                                badge_icon.set_margin_end(6);
-                                badge_icon.set_pixel_size(18);
-                                badge_icon.add_css_class("icon-button");
-                                badge_icon.set_tooltip_text(Some("Открыть карточку монитора"));
-                                let badge = Button::with_label(control_method);
-                                badge.add_css_class("badge");
-                                badge.add_css_class("badge-button");
-                                badge.add_css_class(badge_class);
-                                badge.add_css_class("flat");
-                                badge.set_can_focus(false);
-                                badge.set_tooltip_text(Some(&tooltip));
-                                // Если доступны оба метода — делаем кнопку переключаемой
-                                if d.supports_ddc && d.xrandr_output.is_some() {
-                                    let badge_btn = badge.clone();
-                                    let control_pref_map_for_toggle = control_pref_map_for_async.clone();
-                                    let slider_refs_for_toggle = slider_refs_for_async.clone();
-                                    let brightness_state_for_toggle = brightness_state_for_async.clone();
-                                    let d_for_toggle = d.clone();
-                                    badge.connect_clicked(move |_| {
-                                        // Переключаем предпочтение
-                                        let new_pref = {
-                                            let mut map = control_pref_map_for_toggle.borrow_mut();
-                                            let entry = map.entry(d_for_toggle.i2c_bus).or_insert(ControlMethodPref::Ddc);
-                                            *entry = match *entry { ControlMethodPref::Ddc => ControlMethodPref::Xrandr, ControlMethodPref::Xrandr => ControlMethodPref::Ddc };
-                                            *entry
-                                        };
-                                        // Обновляем визуал
-                                        badge_btn.remove_css_class("badge-ddc");
-                                        badge_btn.remove_css_class("badge-xrandr");
-                                        match new_pref {
-                                            ControlMethodPref::Ddc => {
-                                                badge_btn.add_css_class("badge-ddc");
-                                                badge_btn.set_label("аппаратно");
-                                                badge_btn.set_tooltip_text(Some(&format!("Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}", d_for_toggle.i2c_bus)));
-                                            }
-                                            ControlMethodPref::Xrandr => {
-                                                badge_btn.add_css_class("badge-xrandr");
-                                                badge_btn.set_label("программно");
-                                                if let Some(ref out) = d_for_toggle.xrandr_output {
-                                                    badge_btn.set_tooltip_text(Some(&format!("Управление: программно (xrandr)\nВывод: {}", out)));
+                                    };
+
+                                    // Колонки: порт, тип, название, иконка, бейдж
+                                    let port_lbl = Label::new(Some(port_info));
+                                    port_lbl.add_css_class("port");
+                                    port_lbl.set_xalign(0.0);
+                                    port_lbl.set_width_chars(14);
+                                    let type_lbl = Label::new(Some(port_type));
+                                    type_lbl.add_css_class("type");
+                                    type_lbl.set_xalign(0.0);
+                                    type_lbl.set_width_chars(12);
+                                    let monitor_lbl = Label::new(Some(&monitor_name));
+                                    monitor_lbl.add_css_class("monitor");
+                                    monitor_lbl.set_xalign(0.0);
+                                    monitor_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                                    monitor_lbl.set_hexpand(true);
+                                    let badge_icon = match badge_class {
+                                        "badge-none" => Image::from_icon_name("dialog-warning-symbolic"),
+                                        _ => Image::from_icon_name("video-display-symbolic"),
+                                    };
+                                    // Выравнивание и стили для иконки-кнопки
+                                    badge_icon.set_halign(gtk::Align::Center);
+                                    badge_icon.set_valign(gtk::Align::Center);
+                                    badge_icon.set_margin_start(6);
+                                    badge_icon.set_margin_end(6);
+                                    badge_icon.set_pixel_size(18);
+                                    badge_icon.add_css_class("icon-button");
+                                    badge_icon.set_tooltip_text(Some("Открыть карточку монитора"));
+                                    let badge = Button::with_label(control_method);
+                                    badge.add_css_class("badge");
+                                    badge.add_css_class("badge-button");
+                                    badge.add_css_class(badge_class);
+                                    badge.add_css_class("flat");
+                                    badge.set_can_focus(false);
+                                    badge.set_tooltip_text(Some(&tooltip));
+                                    // Если доступны оба метода — делаем кнопку переключаемой
+                                    if d.supports_ddc && d.xrandr_output.is_some() {
+                                        let badge_btn = badge.clone();
+                                        let control_pref_map_for_toggle = control_pref_map_for_async.clone();
+                                        let slider_refs_for_toggle = slider_refs_for_async.clone();
+                                        let brightness_state_for_toggle = brightness_state_for_async.clone();
+                                        let d_for_toggle = d.clone();
+                                        badge.connect_clicked(move |_| {
+                                            // Переключаем предпочтение
+                                            let new_pref = {
+                                                let mut map = control_pref_map_for_toggle.borrow_mut();
+                                                let entry = map.entry(d_for_toggle.i2c_bus).or_insert(ControlMethodPref::Ddc);
+                                                *entry = match *entry { ControlMethodPref::Ddc => ControlMethodPref::Xrandr, ControlMethodPref::Xrandr => ControlMethodPref::Ddc };
+                                                *entry
+                                            };
+                                            // Обновляем визуал
+                                            badge_btn.remove_css_class("badge-ddc");
+                                            badge_btn.remove_css_class("badge-xrandr");
+                                            match new_pref {
+                                                ControlMethodPref::Ddc => {
+                                                    badge_btn.add_css_class("badge-ddc");
+                                                    badge_btn.set_label("аппаратно");
+                                                    badge_btn.set_tooltip_text(Some(&format!("Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}", d_for_toggle.i2c_bus)));
                                                 }
-                                            }
-                                        }
-                                        // Независимые значения ползунка для каждого метода:
-                                        // 1) Берём сохранённое значение для НОВОГО метода, если есть, иначе текущее
-                                        let (target_val, have_stored) = if let Ok(refs) = slider_refs_for_toggle.try_borrow() {
-                                            let cur = if let Some((scale_ref, _)) = refs.sliders.get(&d_for_toggle.i2c_bus) { scale_ref.value() as u8 } else { 0 };
-                                            if let Some(v) = refs.get_last_value(d_for_toggle.i2c_bus, new_pref) { (v, true) } else { (cur, false) }
-                                        } else { (0, false) };
-                                        // 2) Если есть сохранённое — программно выставляем ползунок в него
-                                        if have_stored {
-                                            if let Ok(mut refs) = slider_refs_for_toggle.try_borrow_mut() {
-                                                refs.update_slider_value(d_for_toggle.i2c_bus, target_val);
-                                            }
-                                        }
-                                        // 3) Применяем яркость выбранным методом
-                                        let d_set = d_for_toggle.clone();
-                                        thread::spawn(move || {
-                                            let _ = set_brightness_with_pref(&d_set, target_val, Some(new_pref));
-                                        });
-                                        // 4) Обновляем состояние и запоминаем это значение для нового метода
-                                        let brightness_state_ui = brightness_state_for_toggle.clone();
-                                        let slider_refs_ui2 = slider_refs_for_toggle.clone();
-                                        glib::spawn_future_local(clone!(@strong d_for_toggle => async move {
-                                            if let Ok(mut st) = brightness_state_ui.try_borrow_mut() {
-                                                st.update_current(d_for_toggle.i2c_bus, target_val);
-                                            }
-                                            if let Ok(mut refs) = slider_refs_ui2.try_borrow_mut() {
-                                                refs.remember_value(d_for_toggle.i2c_bus, new_pref, target_val);
-                                            }
-                                        }));
-                                    });
-                                }
-
-                                grid.attach(&port_lbl, 0, 0, 1, 1);
-                                grid.attach(&type_lbl, 1, 0, 1, 1);
-                                // Перемещаем иконку открытия карточки перед названием монитора
-                                grid.attach(&badge_icon, 2, 0, 1, 1);
-                                grid.attach(&monitor_lbl, 3, 0, 1, 1);
-                                grid.attach(&badge, 4, 0, 1, 1);
-
-                                // Правый слайдер и метка значения
-                                let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-                                scale.set_hexpand(false);
-                                scale.set_width_request(320);
-                                scale.set_halign(gtk::Align::End);
-                                scale.set_draw_value(false);
-                                let value_lbl = Label::new(Some("0%"));
-                                value_lbl.set_width_chars(4); // фиксированная ширина 
-                                value_lbl.set_xalign(1.0);
-                                grid.attach(&scale, 5, 0, 1, 1);
-                                grid.attach(&value_lbl, 6, 0, 1, 1);
-                            
-                            // Try to get brightness using any available method
-                            if !d.supports_ddc && d.xrandr_output.is_none() {
-                                scale.set_sensitive(false);
-                                scale.set_value(0.0);
-                            } else {
-                                scale.set_sensitive(false);
-                                
-                                // Get current brightness using any available method
-                                let (s_tx, s_rx) = async_channel::unbounded::<Result<u8, String>>();
-                                let display_for_brightness = d.clone();
-                                let bus_for_pref = d.i2c_bus;
-                                let pref_for_init = control_pref_map_for_async.borrow().get(&bus_for_pref).copied();
-                                thread::spawn(move || {
-                                    let res = get_brightness_with_pref(&display_for_brightness, pref_for_init);
-                                    let _ = s_tx.send_blocking(res);
-                                });
-                                
-                                let grid_for_tooltip = grid.clone();
-                                let brightness_state_for_init = brightness_state_for_async.clone();
-                                let slider_refs_for_init = slider_refs_for_async.clone();
-                                let control_pref_map_for_init = control_pref_map_for_async.clone();
-                                glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl, @strong control_pref_map_for_init => async move {
-                                    if let Ok(res) = s_rx.recv().await {
-                                        match res {
-                                            Ok(v) => {
-                                                scale.set_value(v as f64);
-                                                scale.set_sensitive(true);
-                                                value_lbl.set_text(&format!("{}%", v));
-                                                
-                                                // Регистрируем слайдер в SliderRefs
-                                                slider_refs_for_init.borrow_mut().add_slider(bus_for_pref, scale.clone(), value_lbl.clone());
-                                                
-                                                // Сохраняем исходное значение после получения реального значения
-                                                brightness_state_for_init.borrow_mut().save_original(bus_for_pref, v);
-                                                // Запоминаем значение для текущего предпочитаемого метода
-                                                if let Ok(pref_map) = control_pref_map_for_init.try_borrow() {
-                                                    if let Some(&pref_m) = pref_map.get(&bus_for_pref) {
-                                                        if let Ok(mut refs) = slider_refs_for_init.try_borrow_mut() {
-                                                            refs.remember_value(bus_for_pref, pref_m, v);
-                                                        }
+                                                ControlMethodPref::Xrandr => {
+                                                    badge_btn.add_css_class("badge-xrandr");
+                                                    badge_btn.set_label("программно");
+                                                    if let Some(ref out) = d_for_toggle.xrandr_output {
+                                                        badge_btn.set_tooltip_text(Some(&format!("Управление: программно (xrandr)\nВывод: {}", out)));
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                scale.set_sensitive(false);
-                                                // Показываем ошибку в подсказке ряда
-                                                grid_for_tooltip.set_tooltip_text(Some(&format!("Ошибка чтения яркости: {}", e)));
+                                            // Независимые значения ползунка для каждого метода:
+                                            // 1) Берём сохранённое значение для НОВОГО метода, если есть, иначе текущее
+                                            let (target_val, have_stored) = if let Ok(refs) = slider_refs_for_toggle.try_borrow() {
+                                                let cur = if let Some((scale_ref, _)) = refs.sliders.get(&d_for_toggle.i2c_bus) { scale_ref.value() as u8 } else { 0 };
+                                                if let Some(v) = refs.get_last_value(d_for_toggle.i2c_bus, new_pref) { (v, true) } else { (cur, false) }
+                                            } else { (0, false) };
+                                            // 2) Если есть сохранённое — программно выставляем ползунок в него
+                                            if have_stored {
+                                                if let Ok(mut refs) = slider_refs_for_toggle.try_borrow_mut() {
+                                                    refs.update_slider_value(d_for_toggle.i2c_bus, target_val);
+                                                }
                                             }
-                                        }
+                                            // 3) Применяем яркость выбранным методом
+                                            let d_set = d_for_toggle.clone();
+                                            thread::spawn(move || {
+                                                let _ = set_brightness_with_pref(&d_set, target_val, Some(new_pref));
+                                            });
+                                            // 4) Обновляем состояние и запоминаем это значение для нового метода
+                                            let brightness_state_ui = brightness_state_for_toggle.clone();
+                                            let slider_refs_ui2 = slider_refs_for_toggle.clone();
+                                            let control_pref_map_ui = control_pref_map_for_toggle.clone();
+                                            glib::spawn_future_local(clone!(@strong d_for_toggle => async move {
+                                                if let Ok(mut st) = brightness_state_ui.try_borrow_mut() {
+                                                    st.update_current(d_for_toggle.i2c_bus, target_val);
+                                                }
+                                                if let Ok(mut refs) = slider_refs_ui2.try_borrow_mut() {
+                                                    refs.remember_value(d_for_toggle.i2c_bus, new_pref, target_val);
+                                                }
+                                                // persist settings
+                                                save_settings_from_state(&control_pref_map_ui, &slider_refs_ui2);
+                                            }));
+                                        });
                                     }
-                                }));
-                                
-                                // Direct brightness control - immediate response
-                                // Create a unique copy for this specific callback to avoid variable capture issues
-                                // ВАЖНО: используем owned значение d, а не ссылку, чтобы избежать проблем с захватом
-                                let display_info_for_callback = d.clone();
-                                
-                                println!("Creating callback for: {} (bus {}) [index: {}]", d.name, d.i2c_bus, display_index);
-                                
-                                let value_lbl_for_change = value_lbl.clone();
-                                let brightness_state_for_callback = brightness_state_for_async.clone();
-                                let control_pref_map_for_callback = control_pref_map_for_async.clone();
-                                let slider_refs_for_callback = slider_refs_for_async.clone();
-                                let start_timer_for_callback = start_timer_for_async.clone();
-                                let all_displays_for_callback = all_displays.clone();
-                                
-                                scale.connect_value_changed(move |s| {
-                                    let val = s.value() as u8;
-                                    let display_clone = display_info_for_callback.clone();
-                                    
-                                    // Проверяем, является ли это программным обновлением
-                                    if let Ok(mut slider_refs_mut) = slider_refs_for_callback.try_borrow_mut() {
-                                        if slider_refs_mut.is_programmatic_update(display_clone.i2c_bus) {
-                                            // Это программное обновление - просто обновляем метку и выходим
+
+                                    grid.attach(&port_lbl, 0, 0, 1, 1);
+                                    grid.attach(&type_lbl, 1, 0, 1, 1);
+                                    // Перемещаем иконку открытия карточки перед названием монитора
+                                    grid.attach(&badge_icon, 2, 0, 1, 1);
+                                    grid.attach(&monitor_lbl, 3, 0, 1, 1);
+                                    grid.attach(&badge, 4, 0, 1, 1);
+
+                                    // Правый слайдер и метка значения
+                                    let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+                                    scale.set_hexpand(false);
+                                    scale.set_width_request(320);
+                                    scale.set_halign(gtk::Align::End);
+                                    scale.set_draw_value(false);
+                                    let value_lbl = Label::new(Some("0%"));
+                                    value_lbl.set_width_chars(4); // фиксированная ширина
+                                    value_lbl.set_xalign(1.0);
+                                    grid.attach(&scale, 5, 0, 1, 1);
+                                    grid.attach(&value_lbl, 6, 0, 1, 1);
+
+                                    // Try to get brightness using any available method
+                                    if !d.supports_ddc && d.xrandr_output.is_none() {
+                                        scale.set_sensitive(false);
+                                        scale.set_value(0.0);
+                                    } else {
+                                        scale.set_sensitive(false);
+
+                                        // Get current brightness using any available method
+                                        let (s_tx, s_rx) = async_channel::unbounded::<Result<u8, String>>();
+                                        let display_for_brightness = d.clone();
+                                        let bus_for_pref = d.i2c_bus;
+                                        let pref_for_init = control_pref_map_for_async.borrow().get(&bus_for_pref).copied();
+                                        thread::spawn(move || {
+                                            let res = get_brightness_with_pref(&display_for_brightness, pref_for_init);
+                                            let _ = s_tx.send_blocking(res);
+                                        });
+
+                                        let grid_for_tooltip = grid.clone();
+                                        let brightness_state_for_init = brightness_state_for_async.clone();
+                                        let slider_refs_for_init = slider_refs_for_async.clone();
+                                        let control_pref_map_for_init = control_pref_map_for_async.clone();
+                                        glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl, @strong control_pref_map_for_init => async move {
+                                            if let Ok(res) = s_rx.recv().await {
+                                                match res {
+                                                    Ok(v) => {
+                                                        scale.set_value(v as f64);
+                                                        scale.set_sensitive(true);
+                                                        value_lbl.set_text(&format!("{}%", v));
+
+                                                        // Регистрируем слайдер в SliderRefs
+                                                        slider_refs_for_init.borrow_mut().add_slider(bus_for_pref, scale.clone(), value_lbl.clone());
+
+                                                        // Сохраняем исходное значение после получения реального значения
+                                                        brightness_state_for_init.borrow_mut().save_original(bus_for_pref, v);
+                                                        // Запоминаем значение для текущего предпочитаемого метода
+                                                        if let Ok(pref_map) = control_pref_map_for_init.try_borrow() {
+                                                            if let Some(&pref_m) = pref_map.get(&bus_for_pref) {
+                                                                if let Ok(mut refs) = slider_refs_for_init.try_borrow_mut() {
+                                                                    refs.remember_value(bus_for_pref, pref_m, v);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        scale.set_sensitive(false);
+                                                        // Показываем ошибку в подсказке ряда
+                                                        grid_for_tooltip.set_tooltip_text(Some(&format!("Ошибка чтения яркости: {}", e)));
+                                                    }
+                                                }
+                                            }
+                                        }));
+
+                                        // Direct brightness control - immediate response
+                                        // Create a unique copy for this specific callback to avoid variable capture issues
+                                        let display_info_for_callback = d.clone();
+
+                                        let value_lbl_for_change = value_lbl.clone();
+                                        let brightness_state_for_callback = brightness_state_for_async.clone();
+                                        let control_pref_map_for_callback = control_pref_map_for_async.clone();
+                                        let slider_refs_for_callback = slider_refs_for_async.clone();
+                                        let start_timer_for_callback = start_timer_for_async.clone();
+                                        let all_displays_for_callback = all_displays.clone();
+
+                                        scale.connect_value_changed(move |s| {
+                                            let val = s.value() as u8;
+                                            let display_clone = display_info_for_callback.clone();
+
+                                            // Проверяем, является ли это программным обновлением
+                                            if let Ok(mut slider_refs_mut) = slider_refs_for_callback.try_borrow_mut() {
+                                                if slider_refs_mut.is_programmatic_update(display_clone.i2c_bus) {
+                                                    value_lbl_for_change.set_text(&format!("{}%", val));
+                                                    return;
+                                                }
+                                            } else {
+                                                value_lbl_for_change.set_text(&format!("{}%", val));
+                                                return;
+                                            }
+
                                             value_lbl_for_change.set_text(&format!("{}%", val));
-                                            return;
-                                        }
-                                    } else {
-                                        // Если не можем получить мутабельную ссылку, значит идет восстановление
-                                        // Просто обновляем метку и выходим
-                                        value_lbl_for_change.set_text(&format!("{}%", val));
-                                        return;
-                                    }
-                                    
-                                    value_lbl_for_change.set_text(&format!("{}%", val));
-                                    let callback_id = format!("{}_{}_bus{}", display_clone.name, display_index, display_clone.i2c_bus);
-                                    
-                                    println!("CALLBACK {}: Setting brightness {} for display: {} (bus {})", 
-                                        callback_id, val, display_clone.name, display_clone.i2c_bus);
-                                    
-                                    // Обновляем состояние
-                                    let (has_changes, _timer_active) = if let Ok(mut state) = brightness_state_for_callback.try_borrow_mut() {
-                                        state.update_current(display_clone.i2c_bus, val);
-                                        (state.has_changes, state.timer_active)
-                                    } else {
-                                        println!("Warning: Could not update brightness state");
-                                        (false, false)
-                                    };
-                                    // Запоминаем значение для текущего метода
-                                    if let Ok(pref_map) = control_pref_map_for_callback.try_borrow() {
-                                        if let Some(&pref_m) = pref_map.get(&display_clone.i2c_bus) {
-                                            if let Ok(mut refs) = slider_refs_for_callback.try_borrow_mut() {
-                                                refs.remember_value(display_clone.i2c_bus, pref_m, val);
+
+                                            // Обновляем состояние
+                                            let (has_changes, _timer_active) = if let Ok(mut state) = brightness_state_for_callback.try_borrow_mut() {
+                                                state.update_current(display_clone.i2c_bus, val);
+                                                (state.has_changes, state.timer_active)
+                                            } else {
+                                                (false, false)
+                                            };
+                                            // Запоминаем значение для текущего метода
+                                            if let Ok(pref_map) = control_pref_map_for_callback.try_borrow() {
+                                                if let Some(&pref_m) = pref_map.get(&display_clone.i2c_bus) {
+                                                    if let Ok(mut refs) = slider_refs_for_callback.try_borrow_mut() {
+                                                        refs.remember_value(display_clone.i2c_bus, pref_m, val);
+                                                    }
+                                                }
                                             }
-                                        }
+                                            // persist settings
+                                            save_settings_from_state(&control_pref_map_for_callback, &slider_refs_for_callback);
+
+                                            // Set brightness immediately in background thread, учитывая предпочтение
+                                            let pref = control_pref_map_for_callback.borrow().get(&display_clone.i2c_bus).copied();
+                                            thread::spawn(move || {
+                                                let _ = set_brightness_with_pref(&display_clone, val, pref);
+                                            });
+
+                                            // Перезапускаем таймер подтверждения при каждом изменении
+                                            if has_changes {
+                                                (start_timer_for_callback)(all_displays_for_callback.clone());
+                                            }
+                                        });
                                     }
-                                    
-                                    // Set brightness immediately in background thread, учитывая предпочтение
-                                    let pref = control_pref_map_for_callback.borrow().get(&display_clone.i2c_bus).copied();
-                                    thread::spawn(move || {
-                                        if let Err(e) = set_brightness_with_pref(&display_clone, val, pref) {
-                                            println!("Failed to set brightness for {}: {}", display_clone.name, e);
-                                        } else {
-                                            println!("Successfully set brightness {} for {}", val, display_clone.name);
+
+                                    // Оборачиваем в "карточку"
+                                    let frame = gtk::Frame::new(None);
+                                    frame.add_css_class("card");
+                                    frame.set_hexpand(true);
+                                    frame.set_child(Some(&grid));
+
+                                    // Добавляем обработчик клика ТОЛЬКО на иконку монитора
+                                    let click_gesture = GestureClick::new();
+                                    let display_for_click = d.clone();
+                                    let win_for_dialog = win_weak_for_measure_outer.clone();
+                                    click_gesture.connect_pressed(move |_, _, _, _| {
+                                        if let Some(win) = win_for_dialog.upgrade() {
+                                            show_monitor_details_dialog(&win, &display_for_click);
                                         }
                                     });
-                                    
-                                    // Перезапускаем таймер подтверждения при каждом изменении
-                                    if has_changes {
-                                        (start_timer_for_callback)(all_displays_for_callback.clone());
-                                    }
+                                    badge_icon.add_controller(click_gesture);
+
+                                    list_box_target.append(&frame);
                                 });
                             }
-                            
-                                // Оборачиваем в "карточку"
-                                let frame = gtk::Frame::new(None);
-                                frame.add_css_class("card");
-                                frame.set_hexpand(true);
-                                frame.set_child(Some(&grid));
-                                
-                                // Добавляем обработчик клика ТОЛЬКО на иконку монитора, чтобы не была кликабельной вся строка
-                                let click_gesture = GestureClick::new();
-                                let display_for_click = d.clone();
-                                let win_for_dialog = win_weak_for_measure_outer.clone();
-                                
-                                click_gesture.connect_pressed(move |_, _, _, _| {
-                                    if let Some(win) = win_for_dialog.upgrade() {
-                                        show_monitor_details_dialog(&win, &display_for_click);
-                                    }
-                                });
-                                
-                                // Вешаем контроллер клика на иконку монитора
-                                badge_icon.add_controller(click_gesture);
-                                
-                                list_box_target.append(&frame);
-                            }
-                            
-                            // Add separator after each card
                             let separator = Separator::new(Orientation::Horizontal);
                             separator.set_margin_top(8);
                             separator.set_margin_bottom(8);
@@ -3272,15 +3357,15 @@ fn build_ui(app: &Application) {
                         }
 
                         // Устанавливаем обработчики кнопок подтверждения
-                        *confirm_handler_rc_for_async.borrow_mut() = Some(Box::new({
+                        *confirm_handler_rc_async.borrow_mut() = Some(Box::new({
                             let all_displays = all_displays.clone();
-                            let confirm_handler = confirm_handler_for_async.clone();
+                            let confirm_handler = confirm_handler_async.clone();
                             move || confirm_handler(all_displays.clone())
                         }));
-                        
-                        *cancel_handler_rc_for_async.borrow_mut() = Some(Box::new({
+
+                        *cancel_handler_rc_async.borrow_mut() = Some(Box::new({
                             let all_displays = all_displays.clone();
-                            let cancel_handler = cancel_handler_for_async.clone();
+                            let cancel_handler = cancel_handler_async.clone();
                             move || cancel_handler(all_displays.clone())
                         }));
 
@@ -3302,13 +3387,14 @@ fn build_ui(app: &Application) {
                         list_box_target.append(&lbl);
                     }
                     Err(err) => {
-                        let lbl = Label::new(Some(&format!("Ошибка обнаружения: {}", err)));
-                        lbl.set_xalign(0.0);
-                        list_box_target.append(&lbl);
+                        let err_lbl = Label::new(Some(&format!("Ошибка: {}", err)));
+                        err_lbl.set_xalign(0.0);
+                        list_box_target.append(&err_lbl);
                     }
                 }
             }
         });
+        force_detect_for_populate.set(false);
     });
 
     // Initial population
@@ -3329,8 +3415,10 @@ fn build_ui(app: &Application) {
     });
 
     // Refresh button
+    let force_detect_on_refresh = force_detect_next.clone();
     let populate_btn = populate.clone();
     refresh_btn.connect_clicked(move |_| {
+        force_detect_on_refresh.set(true);
         populate_btn();
     });
 
