@@ -138,6 +138,21 @@ fn setup_styles() {
         transform: translateY(0px);
         box-shadow: 0 2px 4px alpha(@theme_fg_color, 0.1);
     }
+
+    /* Кнопка-иконка монитора: подсветка при наведении */
+    .icon-button {
+        border-radius: 6px;
+        padding: 4px;
+        transition: background-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .icon-button:hover {
+        background-color: alpha(@theme_selected_bg_color, 0.12);
+        box-shadow: inset 0 0 0 1px alpha(@theme_selected_bg_color, 0.25);
+    }
+    .icon-button:active {
+        background-color: alpha(@theme_selected_bg_color, 0.18);
+        transform: scale(0.98);
+    }
     "#;
 
     let provider = CssProvider::new();
@@ -2917,6 +2932,14 @@ fn build_ui(app: &Application) {
                                     "badge-none" => Image::from_icon_name("dialog-warning-symbolic"),
                                     _ => Image::from_icon_name("video-display-symbolic"),
                                 };
+                                // Выравнивание и стили для иконки-кнопки
+                                badge_icon.set_halign(gtk::Align::Center);
+                                badge_icon.set_valign(gtk::Align::Center);
+                                badge_icon.set_margin_start(6);
+                                badge_icon.set_margin_end(6);
+                                badge_icon.set_pixel_size(18);
+                                badge_icon.add_css_class("icon-button");
+                                badge_icon.set_tooltip_text(Some("Открыть карточку монитора"));
                                 let badge = Label::new(Some(control_method));
                                 badge.add_css_class("badge");
                                 badge.add_css_class(badge_class);
