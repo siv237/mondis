@@ -2632,28 +2632,33 @@ fn build_ui(app: &Application) {
     headerbar.pack_end(&theme_toggle);
     win.set_titlebar(Some(&headerbar));
 
-    // Панель подтверждения изменений (скрыта по умолчанию)
+    // Панель подтверждения изменений (нижняя всплывающая панель через Overlay+Revealer)
     let confirm_bar = GtkBox::new(Orientation::Horizontal, 12);
     confirm_bar.add_css_class("confirm-bar");
-    confirm_bar.set_visible(false);
-    
     let timer_label = Label::new(Some("Изменения будут отменены через 20 сек"));
     timer_label.add_css_class("timer-label");
-    
     let confirm_button = Button::with_label("Подтвердить изменения");
     confirm_button.add_css_class("confirm-button");
-    
     let cancel_button = Button::with_label("Отменить");
     cancel_button.add_css_class("cancel-button");
-    
     confirm_bar.append(&timer_label);
     confirm_bar.append(&confirm_button);
     confirm_bar.append(&cancel_button);
-    vbox.append(&confirm_bar);
+    // revealer для анимированного появления снизу, без смещения контента
+    let confirm_revealer = gtk::Revealer::new();
+    confirm_revealer.set_transition_type(gtk::RevealerTransitionType::SlideUp);
+    confirm_revealer.set_reveal_child(false);
+    confirm_revealer.set_halign(gtk::Align::Fill);
+    confirm_revealer.set_valign(gtk::Align::End);
+    confirm_revealer.set_child(Some(&confirm_bar));
 
     let list_box = GtkBox::new(Orientation::Vertical, 12);
     list_box.set_hexpand(true);
     vbox.append(&list_box);
+    // Основной overlay контейнер: контент как child, revealer панель как overlay
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&vbox));
+    overlay.add_overlay(&confirm_revealer);
     
     // Состояние яркости для отслеживания изменений
     let brightness_state = Rc::new(RefCell::new(BrightnessState::new()));
@@ -2663,11 +2668,11 @@ fn build_ui(app: &Application) {
     let timer_source_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     
     // Функция для запуска таймера обратного отсчета
-    let start_confirmation_timer = {
+    let start_confirmation_timer: Rc<dyn Fn(Vec<DisplayInfo>)> = Rc::new({
         let brightness_state = brightness_state.clone();
         let slider_refs = slider_refs.clone();
         let timer_source_id = timer_source_id.clone();
-        let confirm_bar = confirm_bar.clone();
+        let confirm_revealer = confirm_revealer.clone();
         let timer_label = timer_label.clone();
         
         move |displays: Vec<DisplayInfo>| {
@@ -2677,16 +2682,16 @@ fn build_ui(app: &Application) {
             }
             
             brightness_state.borrow_mut().timer_active = true;
-            confirm_bar.set_visible(true);
+            confirm_revealer.set_reveal_child(true);
             
             let countdown = Rc::new(Cell::new(20));
             let brightness_state_timer = brightness_state.clone();
             let slider_refs_timer = slider_refs.clone();
             let timer_source_id_timer = timer_source_id.clone();
-            let confirm_bar_timer = confirm_bar.clone();
             let timer_label_timer = timer_label.clone();
             let displays_for_timer = displays.clone();
             
+            let confirm_revealer_timer = confirm_revealer.clone();
             let source_id = glib::timeout_add_seconds_local(1, move || {
                 let remaining = countdown.get();
                 if remaining > 0 {
@@ -2728,7 +2733,7 @@ fn build_ui(app: &Application) {
                     }
                     
                     // Скрываем панель подтверждения
-                    confirm_bar_timer.set_visible(false);
+                    confirm_revealer_timer.set_reveal_child(false);
                     
                     // Очищаем ID таймера
                     if let Ok(mut timer_id) = timer_source_id_timer.try_borrow_mut() {
@@ -2742,13 +2747,13 @@ fn build_ui(app: &Application) {
             
             *timer_source_id.borrow_mut() = Some(source_id);
         }
-    };
+    });
     
     // Обработчик кнопки подтверждения
     let confirm_handler = {
         let brightness_state = brightness_state.clone();
         let timer_source_id = timer_source_id.clone();
-        let confirm_bar = confirm_bar.clone();
+        let confirm_revealer = confirm_revealer.clone();
         
         move |displays: Vec<DisplayInfo>| {
             println!("Confirm button clicked - saving brightness profile");
@@ -2779,7 +2784,7 @@ fn build_ui(app: &Application) {
                 state.confirm_changes();
             }
             
-            confirm_bar.set_visible(false);
+            confirm_revealer.set_reveal_child(false);
             println!("Confirm operation completed");
         }
     };
@@ -2789,7 +2794,7 @@ fn build_ui(app: &Application) {
         let brightness_state = brightness_state.clone();
         let slider_refs = slider_refs.clone();
         let timer_source_id = timer_source_id.clone();
-        let confirm_bar = confirm_bar.clone();
+        let confirm_revealer = confirm_revealer.clone();
         
         move |displays: Vec<DisplayInfo>| {
             println!("Cancel button clicked - restoring original brightness values");
@@ -2834,7 +2839,7 @@ fn build_ui(app: &Application) {
                 state.reset_to_original();
             }
             
-            confirm_bar.set_visible(false);
+            confirm_revealer.set_reveal_child(false);
             println!("Cancel operation completed");
         }
     };
@@ -3095,8 +3100,9 @@ fn build_ui(app: &Application) {
 
                                 grid.attach(&port_lbl, 0, 0, 1, 1);
                                 grid.attach(&type_lbl, 1, 0, 1, 1);
-                                grid.attach(&monitor_lbl, 2, 0, 1, 1);
-                                grid.attach(&badge_icon, 3, 0, 1, 1);
+                                // Перемещаем иконку открытия карточки перед названием монитора
+                                grid.attach(&badge_icon, 2, 0, 1, 1);
+                                grid.attach(&monitor_lbl, 3, 0, 1, 1);
                                 grid.attach(&badge, 4, 0, 1, 1);
 
                                 // Правый слайдер и метка значения
@@ -3230,7 +3236,7 @@ fn build_ui(app: &Application) {
                                     
                                     // Перезапускаем таймер подтверждения при каждом изменении
                                     if has_changes {
-                                        start_timer_for_callback(all_displays_for_callback.clone());
+                                        (start_timer_for_callback)(all_displays_for_callback.clone());
                                     }
                                 });
                             }
@@ -3328,6 +3334,6 @@ fn build_ui(app: &Application) {
         populate_btn();
     });
 
-    win.set_child(Some(&vbox));
+    win.set_child(Some(&overlay));
     win.present();
 }
