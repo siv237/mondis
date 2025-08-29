@@ -3050,7 +3050,7 @@ fn build_ui(app: &Application) {
                                 frame.set_hexpand(true);
                                 frame.set_child(Some(&grid));
                                 
-                                // Добавляем обработчик клика для показа подробной информации
+                                // Добавляем обработчик клика ТОЛЬКО на иконку монитора, чтобы не была кликабельной вся строка
                                 let click_gesture = GestureClick::new();
                                 let display_for_click = d.clone();
                                 let win_for_dialog = win_weak_for_measure_outer.clone();
@@ -3061,10 +3061,8 @@ fn build_ui(app: &Application) {
                                     }
                                 });
                                 
-                                frame.add_controller(click_gesture);
-                                
-                                // Добавляем CSS класс для hover эффекта
-                                frame.add_css_class("clickable-card");
+                                // Вешаем контроллер клика на иконку монитора
+                                badge_icon.add_controller(click_gesture);
                                 
                                 list_box_target.append(&frame);
                             }
