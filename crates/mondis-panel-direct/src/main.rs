@@ -44,6 +44,8 @@ fn setup_styles() {
     .badge-ddc { background-color: rgba(46,160,67,0.18); }
     .badge-xrandr { background-color: rgba(56,139,253,0.16); }
     .badge-none { background-color: rgba(0,0,0,0.08); }
+    .badge-button { cursor: pointer; transition: background-color 120ms ease, box-shadow 120ms ease; }
+    .badge-button:hover { box-shadow: inset 0 0 0 1px alpha(@theme_selected_bg_color, 0.25); }
     .port { opacity: 0.8; }
     .type { opacity: 0.8; }
     .monitor { font-weight: 600; }
@@ -260,6 +262,9 @@ struct BrightnessState {
 struct SliderRefs {
     sliders: HashMap<u8, (Scale, Label)>, // i2c_bus -> (slider, value_label)
     programmatic_update: HashMap<u8, bool>, // флаг программного обновления
+    // Последние значения ползунка для каждого метода отдельно
+    last_values_ddc: HashMap<u8, u8>,
+    last_values_xrandr: HashMap<u8, u8>,
 }
 
 impl BrightnessState {
@@ -317,6 +322,8 @@ impl SliderRefs {
         Self {
             sliders: HashMap::new(),
             programmatic_update: HashMap::new(),
+            last_values_ddc: HashMap::new(),
+            last_values_xrandr: HashMap::new(),
         }
     }
     
@@ -348,6 +355,20 @@ impl SliderRefs {
             }
         }
         false
+    }
+
+    fn remember_value(&mut self, bus: u8, method: ControlMethodPref, value: u8) {
+        match method {
+            ControlMethodPref::Ddc => { self.last_values_ddc.insert(bus, value); }
+            ControlMethodPref::Xrandr => { self.last_values_xrandr.insert(bus, value); }
+        }
+    }
+
+    fn get_last_value(&self, bus: u8, method: ControlMethodPref) -> Option<u8> {
+        match method {
+            ControlMethodPref::Ddc => self.last_values_ddc.get(&bus).copied(),
+            ControlMethodPref::Xrandr => self.last_values_xrandr.get(&bus).copied(),
+        }
     }
 }
 
@@ -2316,10 +2337,9 @@ fn set_brightness_any_method(display: &DisplayInfo, value: u8) -> Result<(), Str
     if display.supports_ddc {
         ddc_set_brightness(display.i2c_bus, value)
     } else if let Some(ref output) = display.xrandr_output {
-        let brightness = value as f64 / 100.0;
-        set_xrandr_brightness(output, brightness)
+        xrandr_set_brightness(output, value)
     } else {
-        Err("No brightness control method available".to_string())
+        Err("No available method to set brightness".to_string())
     }
 }
 
@@ -2327,13 +2347,66 @@ fn get_brightness_any_method(display: &DisplayInfo) -> Result<u8, String> {
     if display.supports_ddc {
         ddc_get_brightness(display.i2c_bus)
     } else if let Some(ref output) = display.xrandr_output {
-        let brightness = get_xrandr_brightness(output)?;
-        Ok((brightness * 100.0) as u8)
+        xrandr_get_brightness(output)
     } else {
-        Err("No brightness control method available".to_string())
+        Err("No available method to get brightness".to_string())
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlMethodPref { Ddc, Xrandr }
+
+// Simple xrandr helpers as a fallback software brightness control
+fn xrandr_set_brightness(output: &str, value: u8) -> Result<(), String> {
+    let factor = (value as f32) / 100.0;
+    let status = Command::new("xrandr")
+        .arg("--output").arg(output)
+        .arg("--brightness").arg(format!("{:.2}", factor))
+        .status()
+        .map_err(|e| format!("Failed to run xrandr: {}", e))?;
+    if status.success() { Ok(()) } else { Err(format!("xrandr exited with status: {:?}", status.code())) }
+}
+
+fn xrandr_get_brightness(output: &str) -> Result<u8, String> {
+    let out = Command::new("xrandr")
+        .arg("--verbose").arg("--output").arg(output)
+        .output()
+        .map_err(|e| format!("Failed to run xrandr --verbose: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("xrandr --verbose failed: {:?}", out.status.code()));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Brightness:") {
+            if let Ok(f) = rest.trim().parse::<f32>() {
+                let v = (f * 100.0).round().clamp(0.0, 100.0) as u8;
+                return Ok(v);
+            }
+        }
+    }
+    // Default if not found
+    Ok(100)
+}
+
+fn set_brightness_with_pref(display: &DisplayInfo, value: u8, pref: Option<ControlMethodPref>) -> Result<(), String> {
+    match pref {
+        Some(ControlMethodPref::Ddc) if display.supports_ddc => ddc_set_brightness(display.i2c_bus, value),
+        Some(ControlMethodPref::Xrandr) => {
+            if let Some(ref out) = display.xrandr_output { xrandr_set_brightness(out, value) } else { Err("XRandR not available".into()) }
+        }
+        _ => set_brightness_any_method(display, value),
+    }
+}
+
+fn get_brightness_with_pref(display: &DisplayInfo, pref: Option<ControlMethodPref>) -> Result<u8, String> {
+    match pref {
+        Some(ControlMethodPref::Ddc) if display.supports_ddc => ddc_get_brightness(display.i2c_bus),
+        Some(ControlMethodPref::Xrandr) => {
+            if let Some(ref out) = display.xrandr_output { xrandr_get_brightness(out) } else { Err("XRandR not available".into()) }
+        }
+        _ => get_brightness_any_method(display),
+    }
+}
 fn ddc_set_brightness(i2c_bus: u8, value: u8) -> Result<(), String> {
     let device_path = format!("/dev/i2c-{}", i2c_bus);
     let mut dev = LinuxI2CDevice::new(&device_path, DDC_ADDR)
@@ -2585,6 +2658,8 @@ fn build_ui(app: &Application) {
     // Состояние яркости для отслеживания изменений
     let brightness_state = Rc::new(RefCell::new(BrightnessState::new()));
     let slider_refs = Rc::new(RefCell::new(SliderRefs::new()));
+    // Предпочитаемый метод управления яркостью по шине I2C (если монитор поддерживает оба)
+    let control_pref_map: Rc<RefCell<HashMap<u8, ControlMethodPref>>> = Rc::new(RefCell::new(HashMap::new()));
     let timer_source_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     
     // Функция для запуска таймера обратного отсчета
@@ -2776,6 +2851,7 @@ fn build_ui(app: &Application) {
     // Клонируем переменные для использования в populate
     let brightness_state_for_populate = brightness_state.clone();
     let slider_refs_for_populate = slider_refs.clone();
+    let control_pref_map_for_populate = control_pref_map.clone();
     let start_confirmation_timer_for_populate = start_confirmation_timer.clone();
     let confirm_handler_rc_for_populate = confirm_handler_rc.clone();
     let cancel_handler_rc_for_populate = cancel_handler_rc.clone();
@@ -2814,6 +2890,7 @@ fn build_ui(app: &Application) {
         // Клонируем переменные для async блока
         let brightness_state_for_async = brightness_state_for_populate.clone();
         let slider_refs_for_async = slider_refs_for_populate.clone();
+        let control_pref_map_for_async = control_pref_map_for_populate.clone();
         let start_timer_for_async = start_confirmation_timer_for_populate.clone();
         let confirm_handler_rc_for_async = confirm_handler_rc_for_populate.clone();
         let cancel_handler_rc_for_async = cancel_handler_rc_for_populate.clone();
@@ -2896,6 +2973,12 @@ fn build_ui(app: &Application) {
                                         d.connector.as_ref().map(|c| format!("Коннектор: {}", c)).unwrap_or_else(|| "Нет доступного метода".to_string())
                                     )
                                 };
+                                // Инициализируем предпочтение метода
+                                {
+                                    let mut pref_map = control_pref_map_for_async.borrow_mut();
+                                    let default_pref = if d.supports_ddc { ControlMethodPref::Ddc } else { ControlMethodPref::Xrandr };
+                                    pref_map.entry(d.i2c_bus).or_insert(default_pref);
+                                }
                                 
                                 // Determine port type from connector info
                                 let port_type = if let Some(ref connector) = d.connector {
@@ -2940,10 +3023,75 @@ fn build_ui(app: &Application) {
                                 badge_icon.set_pixel_size(18);
                                 badge_icon.add_css_class("icon-button");
                                 badge_icon.set_tooltip_text(Some("Открыть карточку монитора"));
-                                let badge = Label::new(Some(control_method));
+                                let badge = Button::with_label(control_method);
                                 badge.add_css_class("badge");
+                                badge.add_css_class("badge-button");
                                 badge.add_css_class(badge_class);
+                                badge.add_css_class("flat");
+                                badge.set_can_focus(false);
                                 badge.set_tooltip_text(Some(&tooltip));
+                                // Если доступны оба метода — делаем кнопку переключаемой
+                                if d.supports_ddc && d.xrandr_output.is_some() {
+                                    let badge_btn = badge.clone();
+                                    let control_pref_map_for_toggle = control_pref_map_for_async.clone();
+                                    let slider_refs_for_toggle = slider_refs_for_async.clone();
+                                    let brightness_state_for_toggle = brightness_state_for_async.clone();
+                                    let d_for_toggle = d.clone();
+                                    badge.connect_clicked(move |_| {
+                                        // Переключаем предпочтение
+                                        let new_pref = {
+                                            let mut map = control_pref_map_for_toggle.borrow_mut();
+                                            let entry = map.entry(d_for_toggle.i2c_bus).or_insert(ControlMethodPref::Ddc);
+                                            *entry = match *entry { ControlMethodPref::Ddc => ControlMethodPref::Xrandr, ControlMethodPref::Xrandr => ControlMethodPref::Ddc };
+                                            *entry
+                                        };
+                                        // Обновляем визуал
+                                        badge_btn.remove_css_class("badge-ddc");
+                                        badge_btn.remove_css_class("badge-xrandr");
+                                        match new_pref {
+                                            ControlMethodPref::Ddc => {
+                                                badge_btn.add_css_class("badge-ddc");
+                                                badge_btn.set_label("аппаратно");
+                                                badge_btn.set_tooltip_text(Some(&format!("Управление: аппаратно (DDC/CI)\nШина: /dev/i2c-{}", d_for_toggle.i2c_bus)));
+                                            }
+                                            ControlMethodPref::Xrandr => {
+                                                badge_btn.add_css_class("badge-xrandr");
+                                                badge_btn.set_label("программно");
+                                                if let Some(ref out) = d_for_toggle.xrandr_output {
+                                                    badge_btn.set_tooltip_text(Some(&format!("Управление: программно (xrandr)\nВывод: {}", out)));
+                                                }
+                                            }
+                                        }
+                                        // Независимые значения ползунка для каждого метода:
+                                        // 1) Берём сохранённое значение для НОВОГО метода, если есть, иначе текущее
+                                        let (target_val, have_stored) = if let Ok(refs) = slider_refs_for_toggle.try_borrow() {
+                                            let cur = if let Some((scale_ref, _)) = refs.sliders.get(&d_for_toggle.i2c_bus) { scale_ref.value() as u8 } else { 0 };
+                                            if let Some(v) = refs.get_last_value(d_for_toggle.i2c_bus, new_pref) { (v, true) } else { (cur, false) }
+                                        } else { (0, false) };
+                                        // 2) Если есть сохранённое — программно выставляем ползунок в него
+                                        if have_stored {
+                                            if let Ok(mut refs) = slider_refs_for_toggle.try_borrow_mut() {
+                                                refs.update_slider_value(d_for_toggle.i2c_bus, target_val);
+                                            }
+                                        }
+                                        // 3) Применяем яркость выбранным методом
+                                        let d_set = d_for_toggle.clone();
+                                        thread::spawn(move || {
+                                            let _ = set_brightness_with_pref(&d_set, target_val, Some(new_pref));
+                                        });
+                                        // 4) Обновляем состояние и запоминаем это значение для нового метода
+                                        let brightness_state_ui = brightness_state_for_toggle.clone();
+                                        let slider_refs_ui2 = slider_refs_for_toggle.clone();
+                                        glib::spawn_future_local(clone!(@strong d_for_toggle => async move {
+                                            if let Ok(mut st) = brightness_state_ui.try_borrow_mut() {
+                                                st.update_current(d_for_toggle.i2c_bus, target_val);
+                                            }
+                                            if let Ok(mut refs) = slider_refs_ui2.try_borrow_mut() {
+                                                refs.remember_value(d_for_toggle.i2c_bus, new_pref, target_val);
+                                            }
+                                        }));
+                                    });
+                                }
 
                                 grid.attach(&port_lbl, 0, 0, 1, 1);
                                 grid.attach(&type_lbl, 1, 0, 1, 1);
@@ -2973,16 +3121,18 @@ fn build_ui(app: &Application) {
                                 // Get current brightness using any available method
                                 let (s_tx, s_rx) = async_channel::unbounded::<Result<u8, String>>();
                                 let display_for_brightness = d.clone();
+                                let bus_for_pref = d.i2c_bus;
+                                let pref_for_init = control_pref_map_for_async.borrow().get(&bus_for_pref).copied();
                                 thread::spawn(move || {
-                                    let res = get_brightness_any_method(&display_for_brightness);
+                                    let res = get_brightness_with_pref(&display_for_brightness, pref_for_init);
                                     let _ = s_tx.send_blocking(res);
                                 });
                                 
                                 let grid_for_tooltip = grid.clone();
                                 let brightness_state_for_init = brightness_state_for_async.clone();
-                                let bus_for_init = d.i2c_bus;
                                 let slider_refs_for_init = slider_refs_for_async.clone();
-                                glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl => async move {
+                                let control_pref_map_for_init = control_pref_map_for_async.clone();
+                                glib::spawn_future_local(clone!(@strong scale, @strong grid_for_tooltip, @strong value_lbl, @strong control_pref_map_for_init => async move {
                                     if let Ok(res) = s_rx.recv().await {
                                         match res {
                                             Ok(v) => {
@@ -2991,10 +3141,18 @@ fn build_ui(app: &Application) {
                                                 value_lbl.set_text(&format!("{}%", v));
                                                 
                                                 // Регистрируем слайдер в SliderRefs
-                                                slider_refs_for_init.borrow_mut().add_slider(bus_for_init, scale.clone(), value_lbl.clone());
+                                                slider_refs_for_init.borrow_mut().add_slider(bus_for_pref, scale.clone(), value_lbl.clone());
                                                 
                                                 // Сохраняем исходное значение после получения реального значения
-                                                brightness_state_for_init.borrow_mut().save_original(bus_for_init, v);
+                                                brightness_state_for_init.borrow_mut().save_original(bus_for_pref, v);
+                                                // Запоминаем значение для текущего предпочитаемого метода
+                                                if let Ok(pref_map) = control_pref_map_for_init.try_borrow() {
+                                                    if let Some(&pref_m) = pref_map.get(&bus_for_pref) {
+                                                        if let Ok(mut refs) = slider_refs_for_init.try_borrow_mut() {
+                                                            refs.remember_value(bus_for_pref, pref_m, v);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 scale.set_sensitive(false);
@@ -3014,6 +3172,7 @@ fn build_ui(app: &Application) {
                                 
                                 let value_lbl_for_change = value_lbl.clone();
                                 let brightness_state_for_callback = brightness_state_for_async.clone();
+                                let control_pref_map_for_callback = control_pref_map_for_async.clone();
                                 let slider_refs_for_callback = slider_refs_for_async.clone();
                                 let start_timer_for_callback = start_timer_for_async.clone();
                                 let all_displays_for_callback = all_displays.clone();
@@ -3050,10 +3209,19 @@ fn build_ui(app: &Application) {
                                         println!("Warning: Could not update brightness state");
                                         (false, false)
                                     };
+                                    // Запоминаем значение для текущего метода
+                                    if let Ok(pref_map) = control_pref_map_for_callback.try_borrow() {
+                                        if let Some(&pref_m) = pref_map.get(&display_clone.i2c_bus) {
+                                            if let Ok(mut refs) = slider_refs_for_callback.try_borrow_mut() {
+                                                refs.remember_value(display_clone.i2c_bus, pref_m, val);
+                                            }
+                                        }
+                                    }
                                     
-                                    // Set brightness immediately in background thread
+                                    // Set brightness immediately in background thread, учитывая предпочтение
+                                    let pref = control_pref_map_for_callback.borrow().get(&display_clone.i2c_bus).copied();
                                     thread::spawn(move || {
-                                        if let Err(e) = set_brightness_any_method(&display_clone, val) {
+                                        if let Err(e) = set_brightness_with_pref(&display_clone, val, pref) {
                                             println!("Failed to set brightness for {}: {}", display_clone.name, e);
                                         } else {
                                             println!("Successfully set brightness {} for {}", val, display_clone.name);
