@@ -2735,6 +2735,21 @@ fn build_ui(app: &Application) {
     let slider_refs = Rc::new(RefCell::new(SliderRefs::new()));
     // Предпочитаемый метод управления яркостью по шине I2C (если монитор поддерживает оба)
     let control_pref_map: Rc<RefCell<HashMap<u8, ControlMethodPref>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    // Восстанавливаем настройки UI из persistent-хранилища
+    let persisted = read_settings();
+    {
+        let mut refs = slider_refs.borrow_mut();
+        refs.last_values_ddc = persisted.last_values_ddc.clone();
+        refs.last_values_xrandr = persisted.last_values_xrandr.clone();
+    }
+    {
+        let mut map = control_pref_map.borrow_mut();
+        for (bus, pref_str) in persisted.control_prefs.into_iter() {
+            let pref = if pref_str == "ddc" { ControlMethodPref::Ddc } else { ControlMethodPref::Xrandr };
+            map.insert(bus, pref);
+        }
+    }
     let timer_source_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     
     // Функция для запуска таймера обратного отсчета
@@ -3050,8 +3065,19 @@ fn build_ui(app: &Application) {
                                         _ => "Unknown Monitor".to_string(),
                                     };
 
-                                    let (control_method, badge_class, tooltip) = if d.supports_ddc {
-                                        (
+                                    // Выбираем исходное предпочтение: из настроек, иначе по доступности
+                                    let pref_from_settings = control_pref_map_for_async.borrow().get(&d.i2c_bus).copied();
+                                    let resolved_pref = match pref_from_settings {
+                                        Some(ControlMethodPref::Ddc) if d.supports_ddc => Some(ControlMethodPref::Ddc),
+                                        Some(ControlMethodPref::Xrandr) if d.xrandr_output.is_some() => Some(ControlMethodPref::Xrandr),
+                                        _ => {
+                                            if d.supports_ddc { Some(ControlMethodPref::Ddc) }
+                                            else if d.xrandr_output.is_some() { Some(ControlMethodPref::Xrandr) }
+                                            else { None }
+                                        }
+                                    };
+                                    let (control_method, badge_class, tooltip) = match resolved_pref {
+                                        Some(ControlMethodPref::Ddc) => (
                                             "аппаратно",
                                             "badge-ddc",
                                             format!(
@@ -3059,19 +3085,20 @@ fn build_ui(app: &Application) {
                                                 d.i2c_bus,
                                                 d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
                                             ),
-                                        )
-                                    } else if let Some(ref out) = d.xrandr_output {
-                                        (
-                                            "программно",
-                                            "badge-xrandr",
-                                            format!(
-                                                "Управление: программно (xrandr)\nВывод: {}{}",
-                                                out,
-                                                d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
-                                            ),
-                                        )
-                                    } else {
-                                        (
+                                        ),
+                                        Some(ControlMethodPref::Xrandr) => {
+                                            let out = d.xrandr_output.clone().unwrap_or_default();
+                                            (
+                                                "программно",
+                                                "badge-xrandr",
+                                                format!(
+                                                    "Управление: программно (xrandr)\nВывод: {}{}",
+                                                    out,
+                                                    d.connector.as_ref().map(|c| format!("\nКоннектор: {}", c)).unwrap_or_default()
+                                                ),
+                                            )
+                                        },
+                                        None => (
                                             "нет управления",
                                             "badge-none",
                                             d.connector.as_ref().map(|c| format!("Коннектор: {}", c)).unwrap_or_else(|| "Нет доступного метода".to_string())
@@ -3244,23 +3271,33 @@ fn build_ui(app: &Application) {
                                             if let Ok(res) = s_rx.recv().await {
                                                 match res {
                                                     Ok(v) => {
-                                                        scale.set_value(v as f64);
-                                                        scale.set_sensitive(true);
-                                                        value_lbl.set_text(&format!("{}%", v));
-
                                                         // Регистрируем слайдер в SliderRefs
                                                         slider_refs_for_init.borrow_mut().add_slider(bus_for_pref, scale.clone(), value_lbl.clone());
 
-                                                        // Сохраняем исходное значение после получения реального значения
+                                                        // Сохраняем исходное устройство-значение как оригинал
                                                         brightness_state_for_init.borrow_mut().save_original(bus_for_pref, v);
-                                                        // Запоминаем значение для текущего предпочитаемого метода
+
+                                                        // Если есть сохранённое последнее значение для текущего предпочитаемого метода — отобразим его,
+                                                        // иначе используем прочитанное устройство-значение
                                                         if let Ok(pref_map) = control_pref_map_for_init.try_borrow() {
                                                             if let Some(&pref_m) = pref_map.get(&bus_for_pref) {
                                                                 if let Ok(mut refs) = slider_refs_for_init.try_borrow_mut() {
-                                                                    refs.remember_value(bus_for_pref, pref_m, v);
+                                                                    if let Some(stored) = refs.get_last_value(bus_for_pref, pref_m) {
+                                                                        // Показываем сохранённое пользовательское
+                                                                        refs.update_slider_value(bus_for_pref, stored);
+                                                                        refs.remember_value(bus_for_pref, pref_m, stored);
+                                                                    } else {
+                                                                        // Сохраняем и показываем устройство-значение
+                                                                        scale.set_value(v as f64);
+                                                                        scale.set_sensitive(true);
+                                                                        value_lbl.set_text(&format!("{}%", v));
+                                                                        refs.remember_value(bus_for_pref, pref_m, v);
+                                                                    }
                                                                 }
                                                             }
                                                         }
+                                                        // Разблокируем слайдер на всякий случай
+                                                        scale.set_sensitive(true);
                                                     }
                                                     Err(e) => {
                                                         scale.set_sensitive(false);
