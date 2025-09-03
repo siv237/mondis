@@ -8,7 +8,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # GTK
-gtk = { package = "gtk4", version = "0.7", features = ["v4_10"] }
+gtk = { package = "gtk4", version = "0.7", features = ["v4_6"] }
 glib = "0.18"
 regex = "1"
 async-channel = "2.0"

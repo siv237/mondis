@@ -230,10 +230,10 @@ fn detect_displays_sync() -> Result<Vec<DisplayInfo>, String> {
             continue;
         }
         if re_invalid.is_match(line) {
-            if let Some(d) = cur.take() { res.push(d); }
+            // Skip invalid displays entirely (do not add phantom entries)
+            if let Some(_d) = cur.take() { /* drop */ }
             invalid_count += 1;
-            // Use negative index to mark invalid displays
-            cur = Some(DisplayInfo { index: 200 + invalid_count, model: None, mfg: None, supports_ddc: false });
+            cur = None;
             continue;
         }
         if let Some(c) = re_monitor.captures(line) {
@@ -244,6 +244,8 @@ fn detect_displays_sync() -> Result<Vec<DisplayInfo>, String> {
         }
     }
     if let Some(d) = cur.take() { res.push(d); }
+    // Filter out entries without DDC support or without identification to avoid 'Unknown Monitor'
+    res.retain(|d| d.supports_ddc && d.mfg.is_some() && d.model.is_some());
     Ok(res)
 }
 

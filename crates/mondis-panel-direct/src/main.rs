@@ -10,7 +10,7 @@ use glib::clone;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::thread;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use std::time::Duration;
@@ -27,6 +27,18 @@ fn get_config_dir() -> Result<PathBuf, String> {
     let dir = PathBuf::from(home).join(".config").join("mondis");
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create config dir: {}", e))?;
     Ok(dir)
+}
+
+fn edid_hash_short(edid: &[u8]) -> String {
+    // FNV-1a 32-bit over first 128 bytes
+    let mut hash: u32 = 0x811C9DC5;
+    let prime: u32 = 0x01000193;
+    let len = edid.len().min(128);
+    for &b in &edid[..len] {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(prime);
+    }
+    format!("{:08x}", hash)
 }
 
 fn get_displays_cache_path() -> Result<PathBuf, String> {
@@ -258,6 +270,7 @@ struct DisplayInfo {
     connector: Option<String>,
     supports_ddc: bool,
     xrandr_output: Option<String>,
+    edid_hash: Option<String>,
     card_name: Option<String>,
     port_name: Option<String>,
 }
@@ -1974,35 +1987,29 @@ fn parse_edid_model(edid_data: &[u8]) -> String {
     "Monitor".to_string()
 }
 
-fn get_all_edids_from_sysfs() -> Vec<(String, String, String, String)> {
-    let mut edids = Vec::new();
+fn get_all_edids_from_sysfs() -> Vec<(String, Vec<u8>, String, String)> {
+    // Returns (connector, edid_bytes, manufacturer, model)
+    let mut list = Vec::new();
     let drm_path = "/sys/class/drm";
-    
     if let Ok(entries) = std::fs::read_dir(drm_path) {
         for entry in entries.flatten() {
             let connector_path = entry.path();
             if let Some(name) = connector_path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("card") && (name.contains("DP") || name.contains("HDMI") || name.contains("DVI")) {
+                if name.starts_with("card") && (name.contains("DP") || name.contains("HDMI") || name.contains("DVI") || name.contains("eDP") || name.contains("LVDS") || name.contains("VGA")) {
                     let edid_path = connector_path.join("edid");
                     if let Ok(edid_data) = std::fs::read(&edid_path) {
                         if edid_data.len() >= 128 && edid_data[0] == 0x00 && edid_data[1] == 0xFF {
                             let manufacturer = parse_edid_manufacturer(&edid_data);
                             let model = parse_edid_model(&edid_data);
-                            let serial = format!("{:08X}", 
-                                ((edid_data[12] as u32) << 24) | 
-                                ((edid_data[13] as u32) << 16) | 
-                                ((edid_data[14] as u32) << 8) | 
-                                (edid_data[15] as u32)
-                            );
                             println!("Found EDID in {}: {} {}", name, manufacturer, model);
-                            edids.push((manufacturer, model, serial, name.to_string()));
+                            list.push((name.to_string(), edid_data, manufacturer, model));
                         }
                     }
                 }
             }
         }
     }
-    edids
+    list
 }
 
 fn read_edid(i2c_bus: u8) -> Result<(String, String, String), String> {
@@ -2316,40 +2323,55 @@ fn edid_matches(edid1: &[u8], edid2: &[u8]) -> bool {
 
 fn get_xrandr_output_for_connector(connector: &str) -> Option<String> {
     println!("Mapping connector: {}", connector);
-    
-    // Получаем EDID для DRM коннектора
-    let drm_edid = get_drm_connector_edid(connector)?;
-    if drm_edid.len() < 128 {
-        println!("DRM connector {} has invalid EDID", connector);
-        return None;
+    // Primary: map DRM connector name to xrandr output name by port pattern
+    // Examples: card0-DP-2 -> DP-2, card0-HDMI-A-1 -> HDMI-1
+    let port_guess = if let Some(rest) = connector.splitn(2, '-').nth(1) {
+        // rest like "DP-2" or "HDMI-A-1"
+        if rest.starts_with("DP-") {
+            Some(rest.replace("DP-", "DP-"))
+        } else if rest.starts_with("HDMI-A-") {
+            Some(rest.replacen("HDMI-A-", "HDMI-", 1))
+        } else if rest.starts_with("HDMI-") {
+            Some(rest.to_string())
+        } else if rest.starts_with("DVI-") {
+            Some(rest.to_string())
+        } else if rest.starts_with("eDP-") {
+            Some(rest.to_string())
+        } else if rest.starts_with("LVDS-") {
+            Some(rest.to_string())
+        } else if rest.starts_with("VGA-") {
+            Some(rest.to_string())
+        } else { None }
+    } else { None };
+
+    if let Some(port_name) = port_guess {
+        // Optional: verify EDID matches (for debug only)
+        if let Some(drm_edid) = get_drm_connector_edid(connector) {
+            for (out, edid) in get_xrandr_outputs() {
+                if out == port_name {
+                    if edid_matches(&drm_edid, &edid) {
+                        println!("Verified {} -> {} by EDID", connector, port_name);
+                    } else {
+                        println!("Warning: {} -> {} EDID mismatch (keeping port name)", connector, port_name);
+                    }
+                    break;
+                }
+            }
+        }
+        return Some(port_name);
     }
-    
-    // Получаем все xrandr выводы с их EDID
-    let xrandr_outputs = get_xrandr_outputs();
-    
-    // Ищем соответствие по EDID
-    for (output_name, xrandr_edid) in xrandr_outputs {
-        if edid_matches(&drm_edid, &xrandr_edid) {
-            println!("Matched {} -> {} by EDID", connector, output_name);
-            return Some(output_name);
+
+    // As a last resort try EDID-based matching
+    if let Some(drm_edid) = get_drm_connector_edid(connector) {
+        for (output_name, xrandr_edid) in get_xrandr_outputs() {
+            if edid_matches(&drm_edid, &xrandr_edid) {
+                println!("Matched {} -> {} by EDID (fallback)", connector, output_name);
+                return Some(output_name);
+            }
         }
     }
-    
-    println!("No EDID match found for connector: {}", connector);
-    
-    // Fallback: простое соответствие по типу порта
-    if connector.contains("HDMI") {
-        Some("HDMI-0".to_string())
-    } else if connector.contains("DP") {
-        // Попробуем угадать по номеру порта
-        if let Some(port_num) = connector.split('-').last() {
-            Some(format!("DP-{}", port_num))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    println!("Failed to map connector {} to xrandr output", connector);
+    None
 }
 
 fn set_xrandr_brightness(output: &str, brightness: f64) -> Result<(), String> {
@@ -2495,106 +2517,104 @@ fn ddc_set_brightness(i2c_bus: u8, value: u8) -> Result<(), String> {
 
 fn detect_i2c_displays() -> Result<Vec<DisplayInfo>, String> {
     let mut displays = Vec::new();
-    
-    // Get all EDIDs from sysfs first
-    let all_edids = get_all_edids_from_sysfs();
-    
-    // Map known buses to EDID info based on ddcutil output
-    let bus_edid_map = std::collections::HashMap::from([
-        (3u8, 0usize), // GSM LG TV
-        (5u8, 1usize), // HSI HiTV  
-        (6u8, 2usize), // ACR VG270U
-    ]);
-    
+    // Build sysfs EDID map: connector -> edid bytes and parsed info
+    let sysfs = get_all_edids_from_sysfs();
+
     // Scan common I2C buses (typically 0-10)
     for bus in 0..=10 {
         let device_path = format!("/dev/i2c-{}", bus);
-        if std::path::Path::new(&device_path).exists() {
-            // Try to detect DDC capability first
-            let supports_ddc = ddc_get_brightness(bus).is_ok();
-            
-            // Assign EDID info based on known mapping
-            let (manufacturer, model, serial, connector) = if let Some(&edid_idx) = bus_edid_map.get(&bus) {
-                if edid_idx < all_edids.len() {
-                    let edid = &all_edids[edid_idx];
-                    (Some(edid.0.clone()), Some(edid.1.clone()), Some(edid.2.clone()), Some(edid.3.clone()))
-                } else {
-                    (None, None, None, None)
+        if !std::path::Path::new(&device_path).exists() { continue; }
+
+        // Probe DDC capability
+        let supports_ddc = ddc_get_brightness(bus).is_ok();
+
+        // Try read EDID via I2C for identification
+        let (manufacturer, model, serial, edid_hash_opt, connector_opt) = match read_edid(bus) {
+            Ok((mfg, mdl, ser)) => {
+                // we need the raw bytes to compute hash and match connector; re-read from device
+                let dev_path = format!("/dev/i2c-{}", bus);
+                let mut dev = LinuxI2CDevice::new(&dev_path, EDID_ADDR)
+                    .map_err(|e| format!("Failed to open {} for EDID hash: {}", dev_path, e))?;
+                let _ = dev.write(&[0x00]);
+                thread::sleep(Duration::from_millis(5));
+                let mut edid_bytes = [0u8; 128];
+                if let Err(e) = dev.read(&mut edid_bytes) {
+                    println!("Warn: failed to reread EDID for hash on bus {}: {}", bus, e);
                 }
-            } else {
-                (None, None, None, None)
-            };
-            
-            // Get xrandr output name for fallback brightness control
-            let xrandr_output = connector.as_ref().and_then(|c| get_xrandr_output_for_connector(c));
-            if let Some(ref xrandr_out) = xrandr_output {
-                println!("Bus {}: xrandr output = {}", bus, xrandr_out);
+                let hash = edid_hash_short(&edid_bytes);
+                // Match to sysfs connector by EDID equality
+                let mut connector: Option<String> = None;
+                for (conn_name, sys_edid, _smfg, _smdl) in &sysfs {
+                    if edid_matches(&edid_bytes, sys_edid) {
+                        connector = Some(conn_name.clone());
+                        break;
+                    }
+                }
+                (Some(mfg), Some(mdl), Some(ser), Some(hash), connector)
+            },
+            Err(e) => {
+                println!("Bus {}: EDID read failed: {}", bus, e);
+                (None, None, None, None, None)
             }
-            
-            // Parse connector info for card and port names
-            let (card_name, port_name, _card_num) = if let Some(ref conn) = connector {
-                parse_connector_info(conn)
-            } else {
-                (Some("Unknown GPU".to_string()), Some("Unknown Port".to_string()), 0)
-            };
-            
-            let name = match (&manufacturer, &model) {
-                (Some(mfg), Some(mdl)) => {
-                    let expanded_mfg = match mfg.as_str() {
-                        "ACR" => "Acer",
-                        "GSM" => "LG",
-                        "SAM" => "Samsung", 
-                        "DEL" => "Dell",
-                        "AUS" => "ASUS",
-                        "BNQ" => "BenQ",
-                        "AOC" => "AOC",
-                        "HPN" => "HP",
-                        "LEN" => "Lenovo",
-                        "MSI" => "MSI",
-                        _ => mfg,
-                    };
-                    let connector_info = connector.as_ref()
-                        .map(|c| format!(" • {}", c))
-                        .unwrap_or_default();
-                    let control_method = if supports_ddc {
-                        "DDC"
-                    } else if xrandr_output.is_some() {
-                        "xrandr"
-                    } else {
-                        "нет управления"
-                    };
-                    format!("{} {}{} ({})", expanded_mfg, mdl, connector_info, control_method)
-                }
-                _ => {
-                    let control_method = if supports_ddc {
-                        "DDC"
-                    } else if xrandr_output.is_some() {
-                        "xrandr"
-                    } else {
-                        "нет управления"
-                    };
-                    format!("I2C Device (bus {}) ({})", bus, control_method)
-                }
-            };
-            
-            // Show devices that have EDID info or any brightness control
-            if manufacturer.is_some() || supports_ddc || xrandr_output.is_some() {
-                displays.push(DisplayInfo {
-                    i2c_bus: bus,
-                    name,
-                    manufacturer,
-                    model,
-                    serial,
-                    connector,
-                    supports_ddc,
-                    xrandr_output,
-                    card_name,
-                    port_name,
-                });
+        };
+
+        // Determine xrandr output by connector mapping (port-first strategy)
+        let xrandr_output = connector_opt.as_ref().and_then(|c| get_xrandr_output_for_connector(c));
+        if let Some(ref xrandr_out) = xrandr_output { println!("Bus {}: xrandr output = {}", bus, xrandr_out); }
+
+        // Parse connector info for card and port names
+        let (card_name, port_name, _card_num) = if let Some(ref conn) = connector_opt {
+            parse_connector_info(conn)
+        } else {
+            (Some("Unknown GPU".to_string()), Some("Unknown Port".to_string()), 0)
+        };
+
+        let name = match (&manufacturer, &model) {
+            (Some(mfg), Some(mdl)) => {
+                let expanded_mfg = match mfg.as_str() {
+                    "ACR" => "Acer",
+                    "GSM" => "LG",
+                    "SAM" => "Samsung",
+                    "DEL" => "Dell",
+                    "AUS" => "ASUS",
+                    "BNQ" => "BenQ",
+                    "AOC" => "AOC",
+                    "HPN" => "HP",
+                    "LEN" => "Lenovo",
+                    "MSI" => "MSI",
+                    _ => mfg,
+                };
+                let connector_info = connector_opt.as_ref().map(|c| format!(" • {}", c)).unwrap_or_default();
+                let control_method = if supports_ddc { "DDC" } else if xrandr_output.is_some() { "xrandr" } else { "нет управления" };
+                format!("{} {}{} ({})", expanded_mfg, mdl, connector_info, control_method)
             }
+            _ => {
+                let control_method = if supports_ddc { "DDC" } else if xrandr_output.is_some() { "xrandr" } else { "нет управления" };
+                format!("I2C Device (bus {}) ({})", bus, control_method)
+            }
+        };
+
+        // Include only if we have EDID identification OR xrandr mapping.
+        // Skip pure DDC-only devices (to avoid phantom monitors without EDID/connector binding).
+        if manufacturer.is_some() || xrandr_output.is_some() {
+            displays.push(DisplayInfo {
+                i2c_bus: bus,
+                name,
+                manufacturer,
+                model,
+                serial,
+                connector: connector_opt,
+                supports_ddc,
+                xrandr_output,
+                edid_hash: edid_hash_opt,
+                card_name,
+                port_name,
+            });
+        } else if supports_ddc {
+            println!("Skipping bus {}: DDC responsive but no EDID and no xrandr output (likely non-display or unsupported EDID)", bus);
         }
     }
-    
+
     Ok(displays)
 }
 
