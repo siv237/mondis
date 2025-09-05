@@ -1524,92 +1524,79 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         add_info_row(&vbox, "Яркость:", &format!("{}/100", brightness));
     }
     
-    if let Some(contrast) = details.current_contrast {
-        add_info_row(&vbox, "Контраст:", &format!("{}/100", contrast));
-    }
-    
-    if let Some(ref input_source) = details.current_input_source {
-        add_info_row(&vbox, "Источник входа:", input_source);
-    }
-    
-    if let Some(volume) = details.current_volume {
-        add_info_row(&vbox, "Громкость:", &format!("{}/100", volume));
-    }
-    
-    if let Some(ref power_state) = details.current_power_state {
-        add_info_row(&vbox, "Состояние питания:", power_state);
-    }
-
-    // --- Интерактивные регулировки по аналогии с яркостью (сразу после текущих значений) ---
+    // Определяем шину для DDC слайдеров
     let bus_opt = details.i2c_bus_num.or_else(|| {
         if let Some(rest) = details.i2c_bus.strip_prefix("/dev/i2c-") { rest.parse::<u8>().ok() } else { None }
     });
-    if let Some(bus) = bus_opt {
-        println!("[settings] building DDC sliders for bus {}", bus);
-        let sep = Separator::new(Orientation::Horizontal);
-        sep.set_margin_top(12);
-        sep.set_margin_bottom(6);
-        vbox.append(&sep);
-
-        let title = Label::new(Some("Регулировки (DDC/CI):"));
-        title.set_xalign(0.0);
-        title.set_markup("<b>Регулировки (DDC/CI):</b>");
-        vbox.append(&title);
-        // Временная метка для проверки, что секция отрисована
-        let dbg = Label::new(Some("[debug] секция регулировок активна"));
-        dbg.set_xalign(0.0);
-        vbox.append(&dbg);
-
-        let mut add_slider = |label_text: &str, vcp: u8| {
+    
+    // Хелпер для строки слайдера: диапазон 0..100 (%), запись масштабируем по реальному max; отображаем "N% (raw/max)"
+    let mut add_slider_row = |container: &GtkBox, label_text: &str, vcp: u8| {
+        if let Some(bus) = bus_opt {
             let row = GtkBox::new(Orientation::Horizontal, 12);
             row.set_hexpand(true);
             let l = Label::new(Some(label_text));
             l.set_xalign(0.0);
-            l.set_width_chars(24);
+            l.set_width_chars(20);
             row.append(&l);
 
             let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
             scale.set_hexpand(true);
             scale.set_draw_value(false);
             scale.set_width_request(320);
-            scale.set_margin_top(4);
-            scale.set_margin_bottom(4);
-            scale.set_sensitive(true);
-            let val_lbl = Label::new(Some("0%"));
-            val_lbl.set_width_chars(5);
-            val_lbl.set_xalign(1.0);
 
-            if let Ok((cur,_max)) = read_vcp_value(bus, vcp) {
-                scale.set_value(cur as f64);
-                val_lbl.set_text(&format!("{}%", cur));
+            let val_lbl = Label::new(Some("--"));
+            val_lbl.set_xalign(1.0);
+            val_lbl.set_width_chars(12);
+
+            // Локальный max для данного VCP в ячейке, чтобы можно было читать в обработчике
+            let max_cell = Rc::new(Cell::new(100u16));
+            if let Ok((cur, max)) = read_vcp_value(bus, vcp) {
+                let max_u16 = max as u16;
+                max_cell.set(if max_u16 == 0 { 100 } else { max_u16 });
+                let percent = ((cur as f64) * 100.0 / (max_cell.get() as f64)).round().clamp(0.0, 100.0) as u8;
+                scale.set_value(percent as f64);
+                val_lbl.set_text(&format!("{}% ({}/{})", percent, cur, max_cell.get()));
             }
 
+            // on change: считаем raw из процента: raw = round(percent * max / 100)
+            let max_cell_cl = max_cell.clone();
             scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
-                let v = s.value().round().clamp(0.0, 100.0) as u8;
-                val_lbl.set_text(&format!("{}%", v));
+                let percent = s.value().round().clamp(0.0, 100.0) as u8;
+                let max_val = max_cell_cl.get().max(1);
+                let raw = (((percent as u32) * (max_val as u32) + 50) / 100) as u16; // округление
+                val_lbl.set_text(&format!("{}% ({}/{})", percent, raw, max_val));
                 let bus_local = bus;
                 let vcp_local = vcp;
-                thread::spawn(move || {
-                    if let Err(e) = ddc_set_vcp(bus_local, vcp_local, v) {
-                        eprintln!("Failed to set VCP 0x{:02X} on bus {}: {}", vcp_local, bus_local, e);
-                    }
-                });
+                let raw_lo = (raw & 0xFF) as u8;
+                thread::spawn(move || { let _ = ddc_set_vcp(bus_local, vcp_local, raw_lo); });
             }));
 
             row.append(&scale);
             row.append(&val_lbl);
-            vbox.append(&row);
-        };
+            container.append(&row);
+        } else {
+            add_info_row(container, label_text, "Недоступно (нет шины DDC)");
+        }
+    };
 
-        add_slider("Контраст:", 0x12);
-        add_slider("Управление подсветкой:", 0x13);
-        add_slider("Громкость:", 0x62);
-        add_slider("Красный канал:", 0x16);
-        add_slider("Зеленый канал:", 0x18);
-        add_slider("Синий канал:", 0x1A);
+    // Яркость (0x10) как интерактивная строка
+    add_slider_row(&vbox, "Яркость:", 0x10);
+    
+    // Контраст как интерактивная строка
+    add_slider_row(&vbox, "Контраст:", 0x12);
+    
+    if let Some(ref input_source) = details.current_input_source {
+        add_info_row(&vbox, "Источник входа:", input_source);
+    }
+    
+    // Громкость как интерактивная строка
+    add_slider_row(&vbox, "Громкость:", 0x62);
+    
+    if let Some(ref power_state) = details.current_power_state {
+        add_info_row(&vbox, "Состояние питания:", power_state);
     }
 
-    // Цветовые каналы
+    // Цветовые каналы — заменяем статичные значения на ползунки напротив
     if details.red_gain.is_some() || details.green_gain.is_some() || details.blue_gain.is_some() {
         let separator2 = Separator::new(Orientation::Horizontal);
         separator2.set_margin_top(12);
@@ -1620,23 +1607,13 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         color_label.set_xalign(0.0);
         color_label.set_markup("<b>Цветовые каналы:</b>");
         vbox.append(&color_label);
-        
-        if let Some(red) = details.red_gain {
-            add_info_row(&vbox, "Красный канал:", &format!("{}", red));
-        }
-        
-        if let Some(green) = details.green_gain {
-            add_info_row(&vbox, "Зеленый канал:", &format!("{}", green));
-        }
-        
-        if let Some(blue) = details.blue_gain {
-            add_info_row(&vbox, "Синий канал:", &format!("{}", blue));
-        }
+        // Ползунки R/G/B
+        add_slider_row(&vbox, "Красный канал:", 0x16);
+        add_slider_row(&vbox, "Зеленый канал:", 0x18);
+        add_slider_row(&vbox, "Синий канал:", 0x1A);
     }
-    
-    if let Some(backlight) = details.backlight_control {
-        add_info_row(&vbox, "Управление подсветкой:", &format!("{}", backlight));
-    }
+    // Подсветка как интерактивная строка
+    add_slider_row(&vbox, "Управление подсветкой:", 0x13);
     
     if let Some(ref osd_lang) = details.osd_language {
         add_info_row(&vbox, "Язык OSD:", osd_lang);
@@ -1668,77 +1645,6 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         vbox.append(&vcp_value_label);
     }
     
-    // --- Интерактивные регулировки по аналогии с яркостью ---
-    let bus_opt = details.i2c_bus_num.or_else(|| {
-        // Пытаемся извлечь номер из строки "/dev/i2c-N"
-        if let Some(rest) = details.i2c_bus.strip_prefix("/dev/i2c-") {
-            rest.parse::<u8>().ok()
-        } else { None }
-    });
-    if let Some(bus) = bus_opt {
-        println!("[settings] building DDC sliders for bus {}", bus);
-        let sep = Separator::new(Orientation::Horizontal);
-        sep.set_margin_top(12);
-        sep.set_margin_bottom(6);
-        vbox.append(&sep);
-
-        let title = Label::new(Some("Регулировки (DDC/CI):"));
-        title.set_xalign(0.0);
-        title.set_markup("<b>Регулировки (DDC/CI):</b>");
-        vbox.append(&title);
-
-        // Хелпер для добавления слайдера: (метка, vcp код)
-        let mut add_slider = |label_text: &str, vcp: u8| {
-            let row = GtkBox::new(Orientation::Horizontal, 12);
-            row.set_hexpand(true);
-            let l = Label::new(Some(label_text));
-            l.set_xalign(0.0);
-            l.set_width_chars(24);
-            row.append(&l);
-
-            let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-            scale.set_hexpand(true);
-            scale.set_draw_value(false);
-            let val_lbl = Label::new(Some("0%"));
-            val_lbl.set_width_chars(5);
-            val_lbl.set_xalign(1.0);
-
-            // Инициализация текущим значением, если доступно
-            if let Ok((cur,_max)) = read_vcp_value(bus, vcp) {
-                scale.set_value(cur as f64);
-                val_lbl.set_text(&format!("{}%", cur));
-            }
-
-            // Обработчик изменения
-            scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
-                let v = s.value().round().clamp(0.0, 100.0) as u8;
-                val_lbl.set_text(&format!("{}%", v));
-                let bus_local = bus;
-                let vcp_local = vcp;
-                // Применяем асинхронно, чтобы не блокировать UI
-                thread::spawn(move || {
-                    if let Err(e) = ddc_set_vcp(bus_local, vcp_local, v) {
-                        eprintln!("Failed to set VCP 0x{:02X} on bus {}: {}", vcp_local, bus_local, e);
-                    }
-                });
-            }));
-
-            row.append(&scale);
-            row.append(&val_lbl);
-            vbox.append(&row);
-        };
-
-        // Контраст 0x12
-        add_slider("Контраст:", 0x12);
-        // Подсветка 0x13
-        add_slider("Управление подсветкой:", 0x13);
-        // Громкость 0x62
-        add_slider("Громкость:", 0x62);
-        // RGB каналы
-        add_slider("Красный канал:", 0x16);
-        add_slider("Зеленый канал:", 0x18);
-        add_slider("Синий канал:", 0x1A);
-    }
 
     scrolled.set_child(Some(&vbox));
     scrolled
