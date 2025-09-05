@@ -29,6 +29,22 @@ fn get_config_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+// Универсальная установка VCP значения по коду
+fn ddc_set_vcp(i2c_bus: u8, vcp_code: u8, value: u8) -> Result<(), String> {
+    let device_path = format!("/dev/i2c-{}", i2c_bus);
+    let mut dev = LinuxI2CDevice::new(&device_path, DDC_ADDR)
+        .map_err(|e| format!("Failed to open {}: {}", device_path, e))?;
+
+    // DDC Set VCP request: [source_addr, length, type, vcp_code, hi_byte, lo_byte]
+    let request = [0x51, 0x04, 0x03, vcp_code, 0x00, value];
+    let checksum = 0x6E ^ request.iter().fold(0u8, |acc, &x| acc ^ x);
+    let full_request = [request[0], request[1], request[2], request[3], request[4], request[5], checksum];
+
+    dev.write(&full_request)
+        .map_err(|e| format!("Failed to write DDC set request: {}", e))?;
+    Ok(())
+}
+
 fn edid_hash_short(edid: &[u8]) -> String {
     // FNV-1a 32-bit over first 128 bytes
     let mut hash: u32 = 0x811C9DC5;
@@ -320,6 +336,8 @@ struct MonitorDetails {
     
     // Технические детали
     i2c_bus: String,
+    // Номер I2C шины если известен для управления DDC/CI
+    i2c_bus_num: Option<u8>,
     drm_connector: Option<String>,
     driver: Option<String>,
     pci_path: Option<String>,
@@ -536,8 +554,9 @@ fn read_edid_directly(i2c_bus: u8) -> Result<Vec<u8>, String> {
         println!("    EDID header is valid");
         Ok(edid_data)
     } else {
-        Err(format!("Invalid EDID header: {:02X} {:02X} ... {:02X}", 
-            edid_data[0], edid_data[1], edid_data[7]))
+        Err(format!("Invalid EDID header: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}", 
+            edid_data[0], edid_data[1], edid_data[2], edid_data[3], 
+            edid_data[4], edid_data[5], edid_data[6], edid_data[7]))
     }
 }
 
@@ -768,6 +787,7 @@ fn get_monitor_details(display: &DisplayInfo) -> Result<MonitorDetails, String> 
         backlight_control: None,
         osd_language: None,
         i2c_bus: format!("/dev/i2c-{}", display.i2c_bus),
+        i2c_bus_num: Some(display.i2c_bus),
         drm_connector: display.connector.clone(),
         driver: None,
         pci_path: None,
@@ -1460,7 +1480,6 @@ fn create_basic_info_page(details: &MonitorDetails) -> ScrolledWindow {
     if details.read_errors > 0 {
         add_info_row(&vbox, "Ошибки чтения:", &format!("{}", details.read_errors));
     }
-    
     scrolled.set_child(Some(&vbox));
     scrolled
 }
@@ -1520,7 +1539,76 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
     if let Some(ref power_state) = details.current_power_state {
         add_info_row(&vbox, "Состояние питания:", power_state);
     }
-    
+
+    // --- Интерактивные регулировки по аналогии с яркостью (сразу после текущих значений) ---
+    let bus_opt = details.i2c_bus_num.or_else(|| {
+        if let Some(rest) = details.i2c_bus.strip_prefix("/dev/i2c-") { rest.parse::<u8>().ok() } else { None }
+    });
+    if let Some(bus) = bus_opt {
+        println!("[settings] building DDC sliders for bus {}", bus);
+        let sep = Separator::new(Orientation::Horizontal);
+        sep.set_margin_top(12);
+        sep.set_margin_bottom(6);
+        vbox.append(&sep);
+
+        let title = Label::new(Some("Регулировки (DDC/CI):"));
+        title.set_xalign(0.0);
+        title.set_markup("<b>Регулировки (DDC/CI):</b>");
+        vbox.append(&title);
+        // Временная метка для проверки, что секция отрисована
+        let dbg = Label::new(Some("[debug] секция регулировок активна"));
+        dbg.set_xalign(0.0);
+        vbox.append(&dbg);
+
+        let mut add_slider = |label_text: &str, vcp: u8| {
+            let row = GtkBox::new(Orientation::Horizontal, 12);
+            row.set_hexpand(true);
+            let l = Label::new(Some(label_text));
+            l.set_xalign(0.0);
+            l.set_width_chars(24);
+            row.append(&l);
+
+            let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+            scale.set_hexpand(true);
+            scale.set_draw_value(false);
+            scale.set_width_request(320);
+            scale.set_margin_top(4);
+            scale.set_margin_bottom(4);
+            scale.set_sensitive(true);
+            let val_lbl = Label::new(Some("0%"));
+            val_lbl.set_width_chars(5);
+            val_lbl.set_xalign(1.0);
+
+            if let Ok((cur,_max)) = read_vcp_value(bus, vcp) {
+                scale.set_value(cur as f64);
+                val_lbl.set_text(&format!("{}%", cur));
+            }
+
+            scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
+                let v = s.value().round().clamp(0.0, 100.0) as u8;
+                val_lbl.set_text(&format!("{}%", v));
+                let bus_local = bus;
+                let vcp_local = vcp;
+                thread::spawn(move || {
+                    if let Err(e) = ddc_set_vcp(bus_local, vcp_local, v) {
+                        eprintln!("Failed to set VCP 0x{:02X} on bus {}: {}", vcp_local, bus_local, e);
+                    }
+                });
+            }));
+
+            row.append(&scale);
+            row.append(&val_lbl);
+            vbox.append(&row);
+        };
+
+        add_slider("Контраст:", 0x12);
+        add_slider("Управление подсветкой:", 0x13);
+        add_slider("Громкость:", 0x62);
+        add_slider("Красный канал:", 0x16);
+        add_slider("Зеленый канал:", 0x18);
+        add_slider("Синий канал:", 0x1A);
+    }
+
     // Цветовые каналы
     if details.red_gain.is_some() || details.green_gain.is_some() || details.blue_gain.is_some() {
         let separator2 = Separator::new(Orientation::Horizontal);
@@ -1580,6 +1668,78 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         vbox.append(&vcp_value_label);
     }
     
+    // --- Интерактивные регулировки по аналогии с яркостью ---
+    let bus_opt = details.i2c_bus_num.or_else(|| {
+        // Пытаемся извлечь номер из строки "/dev/i2c-N"
+        if let Some(rest) = details.i2c_bus.strip_prefix("/dev/i2c-") {
+            rest.parse::<u8>().ok()
+        } else { None }
+    });
+    if let Some(bus) = bus_opt {
+        println!("[settings] building DDC sliders for bus {}", bus);
+        let sep = Separator::new(Orientation::Horizontal);
+        sep.set_margin_top(12);
+        sep.set_margin_bottom(6);
+        vbox.append(&sep);
+
+        let title = Label::new(Some("Регулировки (DDC/CI):"));
+        title.set_xalign(0.0);
+        title.set_markup("<b>Регулировки (DDC/CI):</b>");
+        vbox.append(&title);
+
+        // Хелпер для добавления слайдера: (метка, vcp код)
+        let mut add_slider = |label_text: &str, vcp: u8| {
+            let row = GtkBox::new(Orientation::Horizontal, 12);
+            row.set_hexpand(true);
+            let l = Label::new(Some(label_text));
+            l.set_xalign(0.0);
+            l.set_width_chars(24);
+            row.append(&l);
+
+            let scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+            scale.set_hexpand(true);
+            scale.set_draw_value(false);
+            let val_lbl = Label::new(Some("0%"));
+            val_lbl.set_width_chars(5);
+            val_lbl.set_xalign(1.0);
+
+            // Инициализация текущим значением, если доступно
+            if let Ok((cur,_max)) = read_vcp_value(bus, vcp) {
+                scale.set_value(cur as f64);
+                val_lbl.set_text(&format!("{}%", cur));
+            }
+
+            // Обработчик изменения
+            scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
+                let v = s.value().round().clamp(0.0, 100.0) as u8;
+                val_lbl.set_text(&format!("{}%", v));
+                let bus_local = bus;
+                let vcp_local = vcp;
+                // Применяем асинхронно, чтобы не блокировать UI
+                thread::spawn(move || {
+                    if let Err(e) = ddc_set_vcp(bus_local, vcp_local, v) {
+                        eprintln!("Failed to set VCP 0x{:02X} on bus {}: {}", vcp_local, bus_local, e);
+                    }
+                });
+            }));
+
+            row.append(&scale);
+            row.append(&val_lbl);
+            vbox.append(&row);
+        };
+
+        // Контраст 0x12
+        add_slider("Контраст:", 0x12);
+        // Подсветка 0x13
+        add_slider("Управление подсветкой:", 0x13);
+        // Громкость 0x62
+        add_slider("Громкость:", 0x62);
+        // RGB каналы
+        add_slider("Красный канал:", 0x16);
+        add_slider("Зеленый канал:", 0x18);
+        add_slider("Синий канал:", 0x1A);
+    }
+
     scrolled.set_child(Some(&vbox));
     scrolled
 }
