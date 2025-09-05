@@ -253,6 +253,26 @@ fn setup_styles() {
         background-color: alpha(@theme_selected_bg_color, 0.18);
         transform: scale(0.98);
     }
+
+    /* Spoiler / confirm bar overlay styling */
+    .confirm-bar {
+        padding: 10px 12px;
+        margin: 8px 12px 0 12px;
+        border-radius: 10px;
+        background-color: alpha(@theme_bg_color, 0.75);
+        box-shadow: 0 6px 18px alpha(@theme_fg_color, 0.18), 0 2px 6px alpha(@theme_fg_color, 0.12);
+        border: 1px solid alpha(@theme_fg_color, 0.12);
+    }
+    .confirm-button {
+        background-color: alpha(@theme_selected_bg_color, 0.22);
+        border-radius: 8px; padding: 6px 10px;
+    }
+    .cancel-button {
+        background-color: alpha(@theme_fg_color, 0.06);
+        border-radius: 8px; padding: 6px 10px;
+        margin-left: 6px;
+    }
+    .timer-label { opacity: 0.8; }
     "#;
 
     let provider = CssProvider::new();
@@ -1611,8 +1631,16 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         });
     }
 
-    // Добавляем спойлер в начало вкладки
-    vbox.append(&confirm_revealer);
+    // Оборачиваем контент в Overlay, чтобы спойлер накладывался поверх без сдвига
+    let overlay = gtk::Overlay::new();
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+    overlay.set_child(Some(&vbox));
+    confirm_revealer.set_halign(gtk::Align::Fill);
+    confirm_revealer.set_valign(gtk::Align::Start);
+    overlay.add_overlay(&confirm_revealer);
 
     // DDC/CI информация
     if let Some(ref mccs) = details.mccs_version {
@@ -1778,7 +1806,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
     }
     
 
-    scrolled.set_child(Some(&vbox));
+    scrolled.set_child(Some(&overlay));
     scrolled
 }
 
