@@ -66,7 +66,6 @@ install_system_deps() {
     case "$ID_LOWER" in
       ubuntu|debian|linuxmint|pop|neon|zorin|elementary|kali)
         echo -e "${Y}Detected Debian/Ubuntu family${Z}"
-        sudo apt-get update
         sudo apt-get install -y \
           build-essential pkg-config curl git \
           libgtk-4-dev libdbus-1-dev libxrandr-dev
@@ -103,7 +102,6 @@ install_system_deps() {
         # Try by ID_LIKE
         if echo "$ID_LIKE_LOWER" | grep -q debian; then
           echo -e "${Y}Detected Debian-like via ID_LIKE${Z}"
-          sudo apt-get update
           sudo apt-get install -y \
             build-essential pkg-config curl git \
             libgtk-4-dev libdbus-1-dev libxrandr-dev
