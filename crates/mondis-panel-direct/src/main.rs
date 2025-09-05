@@ -1547,6 +1547,8 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
     let timer_lbl_cl = timer_lbl.clone();
     // Регистрируем сеттеры UI для отката положения ползунков: vcp -> setter(raw)
     let ui_setters: Rc<RefCell<HashMap<u8, Box<dyn Fn(u16)>>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Флаг подавления обработчиков при программном откате (чтобы не вызывать value_changed заново)
+    let suppress_flag = Rc::new(Cell::new(false));
     // Вычисляем шину один раз для всех операций отката/подтверждения
     let bus_for_ddc = details
         .i2c_bus_num
@@ -1561,6 +1563,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         let revealer_for_timer = revealer_cl.clone();
         let bus_for_timer = bus_for_ddc;
         let ui_setters_for_timer = ui_setters.clone();
+        let suppress_flag_for_timer = suppress_flag.clone();
         move || {
             // Сброс предыдущего таймера
             if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
@@ -1573,6 +1576,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                 let originals = originals_for_timer.clone();
                 let bus_opt = bus_for_timer;
                 let ui_setters = ui_setters_for_timer.clone();
+                let suppress_flag_t = suppress_flag_for_timer.clone();
                 move || {
                     let left = sec_left.get() - 1;
                     sec_left.set(left);
@@ -1585,6 +1589,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                         if let Some(bus) = bus_opt {
                             // Собираем пары, чтобы дважды не брать borrow()
                             let pairs: Vec<(u8,u16)> = originals.borrow().iter().map(|(k,v)| (*k, *v)).collect();
+                            suppress_flag_t.set(true);
                             for (vcp_code, raw) in pairs {
                                 let v_lo = (raw & 0xFF) as u8;
                                 // Обновляем монитор
@@ -1594,6 +1599,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                                     setter(raw);
                                 }
                             }
+                            suppress_flag_t.set(false);
                         }
                         originals.borrow_mut().clear();
                         revealer.set_reveal_child(false);
@@ -1626,11 +1632,13 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         let revealer = confirm_revealer.clone();
         let details_bus = bus_for_ddc;
         let ui_setters_cancel = ui_setters.clone();
+        let suppress_flag_cancel = suppress_flag.clone();
         cancel_btn.connect_clicked(move |_| {
             // Откат всех VCP
             if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
             if let Some(bus) = details_bus {
                 let pairs: Vec<(u8,u16)> = originals.borrow().iter().map(|(k,v)| (*k, *v)).collect();
+                suppress_flag_cancel.set(true);
                 for (vcp_code, raw) in pairs {
                     let v_lo = (raw & 0xFF) as u8;
                     // Обновляем монитор
@@ -1640,6 +1648,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                         setter(raw);
                     }
                 }
+                suppress_flag_cancel.set(false);
             }
             originals.borrow_mut().clear();
             sec_left.set(0);
@@ -1738,7 +1747,9 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
             let originals_cl = originals.clone();
             let confirm_revealer_cl = confirm_revealer.clone();
             let start_timer = start_or_restart_timer.clone();
+            let suppress_flag_cl = suppress_flag.clone();
             scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
+                if suppress_flag_cl.get() { return; }
                 let percent = s.value().round().clamp(0.0, 100.0) as u8;
                 let max_val = max_cell_cl.get().max(1);
                 let raw = (((percent as u32) * (max_val as u32) + 50) / 100) as u16; // округление
