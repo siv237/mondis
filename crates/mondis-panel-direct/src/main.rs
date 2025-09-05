@@ -1545,6 +1545,8 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
     let timer_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let revealer_cl = confirm_revealer.clone();
     let timer_lbl_cl = timer_lbl.clone();
+    // Регистрируем сеттеры UI для отката положения ползунков: vcp -> setter(raw)
+    let ui_setters: Rc<RefCell<HashMap<u8, Box<dyn Fn(u16)>>>> = Rc::new(RefCell::new(HashMap::new()));
     // Вычисляем шину один раз для всех операций отката/подтверждения
     let bus_for_ddc = details
         .i2c_bus_num
@@ -1558,6 +1560,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         let originals_for_timer = originals.clone();
         let revealer_for_timer = revealer_cl.clone();
         let bus_for_timer = bus_for_ddc;
+        let ui_setters_for_timer = ui_setters.clone();
         move || {
             // Сброс предыдущего таймера
             if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
@@ -1569,6 +1572,7 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                 let revealer = revealer_for_timer.clone();
                 let originals = originals_for_timer.clone();
                 let bus_opt = bus_for_timer;
+                let ui_setters = ui_setters_for_timer.clone();
                 move || {
                     let left = sec_left.get() - 1;
                     sec_left.set(left);
@@ -1579,10 +1583,16 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                         // автооткат
                         // Пытаемся восстановить все VCP
                         if let Some(bus) = bus_opt {
-                            for (vcp, raw) in originals.borrow().iter() {
+                            // Собираем пары, чтобы дважды не брать borrow()
+                            let pairs: Vec<(u8,u16)> = originals.borrow().iter().map(|(k,v)| (*k, *v)).collect();
+                            for (vcp_code, raw) in pairs {
                                 let v_lo = (raw & 0xFF) as u8;
-                                let vcp_code = *vcp;
+                                // Обновляем монитор
                                 thread::spawn(move || { let _ = ddc_set_vcp(bus, vcp_code, v_lo); });
+                                // Обновляем UI (ползунок)
+                                if let Some(setter) = ui_setters.borrow().get(&vcp_code) {
+                                    setter(raw);
+                                }
                             }
                         }
                         originals.borrow_mut().clear();
@@ -1615,14 +1625,20 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
         let originals = originals.clone();
         let revealer = confirm_revealer.clone();
         let details_bus = bus_for_ddc;
+        let ui_setters_cancel = ui_setters.clone();
         cancel_btn.connect_clicked(move |_| {
             // Откат всех VCP
             if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
             if let Some(bus) = details_bus {
-                for (vcp, raw) in originals.borrow().iter() {
+                let pairs: Vec<(u8,u16)> = originals.borrow().iter().map(|(k,v)| (*k, *v)).collect();
+                for (vcp_code, raw) in pairs {
                     let v_lo = (raw & 0xFF) as u8;
-                    let vcp_code = *vcp;
+                    // Обновляем монитор
                     thread::spawn(move || { let _ = ddc_set_vcp(bus, vcp_code, v_lo); });
+                    // Обновляем UI
+                    if let Some(setter) = ui_setters_cancel.borrow().get(&vcp_code) {
+                        setter(raw);
+                    }
                 }
             }
             originals.borrow_mut().clear();
@@ -1702,6 +1718,19 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
                 let percent = ((cur as f64) * 100.0 / (max_cell.get() as f64)).round().clamp(0.0, 100.0) as u8;
                 scale.set_value(percent as f64);
                 val_lbl.set_text(&format!("{}% ({}/{})", percent, cur, max_cell.get()));
+            }
+
+            // Регистрируем сеттер UI для отката по этому VCP
+            {
+                let scale_cl = scale.clone();
+                let val_lbl_cl = val_lbl.clone();
+                let max_cell_for_setter = max_cell.clone();
+                ui_setters.borrow_mut().insert(vcp, Box::new(move |raw: u16| {
+                    let max_val = max_cell_for_setter.get().max(1);
+                    let percent = (((raw as u32) * 100 + (max_val as u32)/2) / (max_val as u32)).min(100) as u16;
+                    scale_cl.set_value(percent as f64);
+                    val_lbl_cl.set_text(&format!("{}% ({}/{})", percent, raw, max_val));
+                }));
             }
 
             // on change: считаем raw из процента: raw = round(percent * max / 100)
