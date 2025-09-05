@@ -1496,6 +1496,124 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
     
+    // Локальное состояние подтверждения изменений (спойлер)
+    let confirm_revealer = gtk::Revealer::new();
+    confirm_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    confirm_revealer.set_reveal_child(false);
+    confirm_revealer.set_halign(gtk::Align::Fill);
+    confirm_revealer.set_valign(gtk::Align::Start);
+
+    let confirm_bar = GtkBox::new(Orientation::Horizontal, 12);
+    confirm_bar.add_css_class("confirm-bar");
+    let confirm_btn = Button::with_label("Подтвердить изменения");
+    confirm_btn.add_css_class("confirm-button");
+    let cancel_btn = Button::with_label("Отменить");
+    cancel_btn.add_css_class("cancel-button");
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let timer_lbl = Label::new(Some("Изменения будут отменены через 20 сек"));
+    timer_lbl.add_css_class("timer-label");
+    confirm_bar.append(&confirm_btn);
+    confirm_bar.append(&cancel_btn);
+    confirm_bar.append(&spacer);
+    confirm_bar.append(&timer_lbl);
+    confirm_revealer.set_child(Some(&confirm_bar));
+
+    // Состояние подтверждения для этой вкладки
+    let originals: Rc<RefCell<HashMap<u8, u16>>> = Rc::new(RefCell::new(HashMap::new())); // vcp -> raw original
+    let sec_left = Rc::new(Cell::new(20));
+    let timer_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let revealer_cl = confirm_revealer.clone();
+    let timer_lbl_cl = timer_lbl.clone();
+    // Вычисляем шину один раз для всех операций отката/подтверждения
+    let bus_for_ddc = details
+        .i2c_bus_num
+        .or_else(|| details.i2c_bus.strip_prefix("/dev/i2c-").and_then(|s| s.parse::<u8>().ok()));
+
+    // Функция запуска/перезапуска таймера
+    let start_or_restart_timer = {
+        let sec_left = sec_left.clone();
+        let timer_id = timer_id.clone();
+        let timer_lbl = timer_lbl_cl.clone();
+        let originals_for_timer = originals.clone();
+        let revealer_for_timer = revealer_cl.clone();
+        let bus_for_timer = bus_for_ddc;
+        move || {
+            // Сброс предыдущего таймера
+            if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
+            sec_left.set(20);
+            timer_lbl.set_text("Изменения будут отменены через 20 сек");
+            *timer_id.borrow_mut() = Some(glib::timeout_add_seconds_local(1, {
+                let sec_left = sec_left.clone();
+                let timer_lbl = timer_lbl.clone();
+                let revealer = revealer_for_timer.clone();
+                let originals = originals_for_timer.clone();
+                let bus_opt = bus_for_timer;
+                move || {
+                    let left = sec_left.get() - 1;
+                    sec_left.set(left);
+                    if left > 0 {
+                        timer_lbl.set_text(&format!("Изменения будут отменены через {} сек", left));
+                        glib::ControlFlow::Continue
+                    } else {
+                        // автооткат
+                        // Пытаемся восстановить все VCP
+                        if let Some(bus) = bus_opt {
+                            for (vcp, raw) in originals.borrow().iter() {
+                                let v_lo = (raw & 0xFF) as u8;
+                                let vcp_code = *vcp;
+                                thread::spawn(move || { let _ = ddc_set_vcp(bus, vcp_code, v_lo); });
+                            }
+                        }
+                        originals.borrow_mut().clear();
+                        revealer.set_reveal_child(false);
+                        glib::ControlFlow::Break
+                    }
+                }
+            }));
+        }
+    };
+
+    // Кнопки подтверждения/отмены
+    {
+        let sec_left = sec_left.clone();
+        let timer_id = timer_id.clone();
+        let originals = originals.clone();
+        let revealer = confirm_revealer.clone();
+        confirm_btn.connect_clicked(move |_| {
+            // Подтверждаем: просто очищаем состояние и скрываем панель
+            if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
+            originals.borrow_mut().clear();
+            sec_left.set(0);
+            revealer.set_reveal_child(false);
+        });
+    }
+
+    {
+        let sec_left = sec_left.clone();
+        let timer_id = timer_id.clone();
+        let originals = originals.clone();
+        let revealer = confirm_revealer.clone();
+        let details_bus = bus_for_ddc;
+        cancel_btn.connect_clicked(move |_| {
+            // Откат всех VCP
+            if let Some(id) = timer_id.borrow_mut().take() { id.remove(); }
+            if let Some(bus) = details_bus {
+                for (vcp, raw) in originals.borrow().iter() {
+                    let v_lo = (raw & 0xFF) as u8;
+                    let vcp_code = *vcp;
+                    thread::spawn(move || { let _ = ddc_set_vcp(bus, vcp_code, v_lo); });
+                }
+            }
+            originals.borrow_mut().clear();
+            sec_left.set(0);
+            revealer.set_reveal_child(false);
+        });
+    }
+
+    // Добавляем спойлер в начало вкладки
+    vbox.append(&confirm_revealer);
+
     // DDC/CI информация
     if let Some(ref mccs) = details.mccs_version {
         add_info_row(&vbox, "Версия MCCS:", mccs);
@@ -1560,11 +1678,25 @@ fn create_settings_page(details: &MonitorDetails) -> ScrolledWindow {
 
             // on change: считаем raw из процента: raw = round(percent * max / 100)
             let max_cell_cl = max_cell.clone();
+            let originals_cl = originals.clone();
+            let confirm_revealer_cl = confirm_revealer.clone();
+            let start_timer = start_or_restart_timer.clone();
             scale.connect_value_changed(clone!(@strong val_lbl => move |s| {
                 let percent = s.value().round().clamp(0.0, 100.0) as u8;
                 let max_val = max_cell_cl.get().max(1);
                 let raw = (((percent as u32) * (max_val as u32) + 50) / 100) as u16; // округление
                 val_lbl.set_text(&format!("{}% ({}/{})", percent, raw, max_val));
+                // Сохраняем оригинальное значение при первом изменении этого VCP
+                if !originals_cl.borrow().contains_key(&vcp) {
+                    if let Ok((cur, _m)) = read_vcp_value(bus, vcp) {
+                        originals_cl.borrow_mut().insert(vcp, cur as u16);
+                    }
+                }
+                // Показываем спойлер и запускаем/перезапускаем таймер
+                if !confirm_revealer_cl.reveals_child() {
+                    confirm_revealer_cl.set_reveal_child(true);
+                }
+                start_timer();
                 let bus_local = bus;
                 let vcp_local = vcp;
                 let raw_lo = (raw & 0xFF) as u8;
