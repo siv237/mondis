@@ -133,10 +133,12 @@ fn setup_styles() {
     .monitor { font-weight: 600; }
     .confirm-bar { 
         padding: 12px; 
-        border-radius: 8px; 
-        background: alpha(@warning_color, 0.1);
-        border: 1px solid alpha(@warning_color, 0.3);
-        margin-bottom: 12px;
+        border-radius: 12px; 
+        background: alpha(@theme_base_color, 0.45);
+        border: 1px solid alpha(@theme_fg_color, 0.12);
+        margin-top: 12px;
+        box-shadow: 0 8px 24px alpha(@theme_fg_color, 0.15), 0 2px 6px alpha(@theme_fg_color, 0.12);
+        backdrop-filter: blur(10px);
     }
     .confirm-button { 
         background: @success_color; 
@@ -188,8 +190,9 @@ fn setup_styles() {
         background: @error_color_light;
     }
     window:not(.dark) .confirm-bar {
-        background: alpha(@warning_color_light, 0.1);
-        border-color: alpha(@warning_color_light, 0.3);
+        background: alpha(@theme_base_color, 0.55);
+        border-color: alpha(@theme_fg_color, 0.12);
+        backdrop-filter: blur(10px);
     }
     
     /* Для темной темы */
@@ -203,8 +206,9 @@ fn setup_styles() {
         background: @error_color_dark;
     }
     window.dark .confirm-bar {
-        background: alpha(@warning_color_dark, 0.1);
-        border-color: alpha(@warning_color_dark, 0.3);
+        background: alpha(@theme_base_color, 0.35);
+        border-color: alpha(@theme_fg_color, 0.14);
+        backdrop-filter: blur(10px);
     }
     
     /* Стили для кликабельных карточек */
@@ -2727,19 +2731,25 @@ fn build_ui(app: &Application) {
     confirm_bar.add_css_class("confirm-bar");
     let timer_label = Label::new(Some("Изменения будут отменены через 20 сек"));
     timer_label.add_css_class("timer-label");
+    timer_label.set_xalign(1.0);
     let confirm_button = Button::with_label("Подтвердить изменения");
     confirm_button.add_css_class("confirm-button");
     let cancel_button = Button::with_label("Отменить");
     cancel_button.add_css_class("cancel-button");
-    confirm_bar.append(&timer_label);
+    // Кнопки слева, текст таймера справа. Для этого используем растягивающийся спейсер.
     confirm_bar.append(&confirm_button);
     confirm_bar.append(&cancel_button);
-    // revealer для анимированного появления снизу, без смещения контента
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    confirm_bar.append(&spacer);
+    confirm_bar.append(&timer_label);
+    // revealer для анимированного появления сверху, без смещения контента
     let confirm_revealer = gtk::Revealer::new();
-    confirm_revealer.set_transition_type(gtk::RevealerTransitionType::SlideUp);
+    // Переносим панель наверх: выравнивание по верхнему краю и анимация выпадания вниз
+    confirm_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
     confirm_revealer.set_reveal_child(false);
     confirm_revealer.set_halign(gtk::Align::Fill);
-    confirm_revealer.set_valign(gtk::Align::End);
+    confirm_revealer.set_valign(gtk::Align::Start);
     confirm_revealer.set_child(Some(&confirm_bar));
 
     let list_box = GtkBox::new(Orientation::Vertical, 12);
