@@ -133,12 +133,10 @@ fn setup_styles() {
     .monitor { font-weight: 600; }
     .confirm-bar { 
         padding: 12px; 
-        border-radius: 12px; 
-        background: alpha(@theme_base_color, 0.45);
-        border: 1px solid alpha(@theme_fg_color, 0.12);
+        border-radius: 8px; 
+        background: alpha(@warning_color, 0.1);
+        border: 1px solid alpha(@warning_color, 0.3);
         margin-top: 12px;
-        box-shadow: 0 8px 24px alpha(@theme_fg_color, 0.15), 0 2px 6px alpha(@theme_fg_color, 0.12);
-        backdrop-filter: blur(10px);
     }
     .confirm-button { 
         background: @success_color; 
@@ -190,9 +188,8 @@ fn setup_styles() {
         background: @error_color_light;
     }
     window:not(.dark) .confirm-bar {
-        background: alpha(@theme_base_color, 0.55);
-        border-color: alpha(@theme_fg_color, 0.12);
-        backdrop-filter: blur(10px);
+        background: alpha(@warning_color_light, 0.1);
+        border-color: alpha(@warning_color_light, 0.3);
     }
     
     /* Для темной темы */
@@ -206,9 +203,8 @@ fn setup_styles() {
         background: @error_color_dark;
     }
     window.dark .confirm-bar {
-        background: alpha(@theme_base_color, 0.35);
-        border-color: alpha(@theme_fg_color, 0.14);
-        backdrop-filter: blur(10px);
+        background: alpha(@warning_color_dark, 0.1);
+        border-color: alpha(@warning_color_dark, 0.3);
     }
     
     /* Стили для кликабельных карточек */
