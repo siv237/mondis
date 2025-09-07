@@ -3,7 +3,6 @@ members = [
     "crates/mondis-core",
     "crates/mondis-x11",
     "crates/mondis-ddc",
-    "crates/mondis-panel",
     "crates/mondis-panel-direct",
     "crates/mondis-tray",
 ]
