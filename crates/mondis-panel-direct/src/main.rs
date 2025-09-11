@@ -2278,6 +2278,25 @@ fn get_all_edids_from_sysfs() -> Vec<(String, Vec<u8>, String, String)> {
     list
 }
 
+fn read_edid_raw(i2c_bus: u8) -> Result<Vec<u8>, String> {
+    let device_path = format!("/dev/i2c-{}", i2c_bus);
+    let mut dev = LinuxI2CDevice::new(&device_path, EDID_ADDR)
+        .map_err(|e| format!("Failed to open {} for EDID: {}", device_path, e))?;
+    
+    // Write EDID offset (0x00) first
+    dev.write(&[0x00])
+        .map_err(|e| format!("Failed to write EDID offset: {}", e))?;
+    
+    thread::sleep(Duration::from_millis(10));
+    
+    // Read EDID (128 bytes minimum)
+    let mut edid_data = vec![0u8; 128];
+    dev.read(&mut edid_data)
+        .map_err(|e| format!("Failed to read EDID: {}", e))?;
+    
+    Ok(edid_data)
+}
+
 fn read_edid(i2c_bus: u8) -> Result<(String, String, String), String> {
     let device_path = format!("/dev/i2c-{}", i2c_bus);
     let mut dev = LinuxI2CDevice::new(&device_path, EDID_ADDR)
@@ -2588,16 +2607,23 @@ fn edid_matches(edid1: &[u8], edid2: &[u8]) -> bool {
 }
 
 fn get_xrandr_output_for_connector(connector: &str) -> Option<String> {
-    println!("Mapping connector: {}", connector);
+    println!("DEBUG: Mapping connector: '{}'", connector);
     // Primary: map DRM connector name to xrandr output name by port pattern
-    // Examples: card0-DP-2 -> DP-2, card0-HDMI-A-1 -> HDMI-1
+    // Examples: card0-DP-2 -> DP-2, card0-HDMI-A-1 -> HDMI-0
     let port_guess = if let Some(rest) = connector.splitn(2, '-').nth(1) {
+        println!("DEBUG: rest after first split: '{}'", rest);
         // rest like "DP-2" or "HDMI-A-1"
         if rest.starts_with("DP-") {
             Some(rest.replace("DP-", "DP-"))
         } else if rest.starts_with("HDMI-A-") {
-            Some(rest.replacen("HDMI-A-", "HDMI-", 1))
+            // HDMI-A-1 -> HDMI-0 (nvidia uses HDMI-0, HDMI-1, etc)
+            let num = rest.chars().last().unwrap_or('1');
+            let idx = (num as u8 - b'1') as i32;
+            let result = format!("HDMI-{}", idx);
+            println!("DEBUG: HDMI-A mapping: {} -> {}", rest, result);
+            Some(result)
         } else if rest.starts_with("HDMI-") {
+            println!("DEBUG: Direct HDMI mapping: {}", rest);
             Some(rest.to_string())
         } else if rest.starts_with("DVI-") {
             Some(rest.to_string())
@@ -2826,6 +2852,27 @@ fn detect_i2c_displays() -> Result<Vec<DisplayInfo>, String> {
 
         // Determine xrandr output by connector mapping (port-first strategy)
         let xrandr_output = connector_opt.as_ref().and_then(|c| get_xrandr_output_for_connector(c));
+        
+        // Fallback: if no connector found in sysfs, try to match by EDID with active xrandr outputs
+        let xrandr_output = if xrandr_output.is_none() && edid_hash_opt.is_some() {
+            let mut matched_output = None;
+            // Get active xrandr outputs and try to match by manufacturer/model
+            let xrandr_outputs = get_xrandr_outputs();
+            for (output_name, xrandr_edid) in &xrandr_outputs {
+                // Try to match by EDID
+                if let Ok(bus_edid) = read_edid_raw(bus) {
+                    if edid_matches(&bus_edid, xrandr_edid) {
+                        println!("Bus {}: Matched to xrandr output {} by EDID", bus, output_name);
+                        matched_output = Some(output_name.clone());
+                        break;
+                    }
+                }
+            }
+            matched_output
+        } else {
+            xrandr_output
+        };
+        
         if let Some(ref xrandr_out) = xrandr_output { println!("Bus {}: xrandr output = {}", bus, xrandr_out); }
 
         // Parse connector info for card and port names
